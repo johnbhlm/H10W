@@ -1,0 +1,15 @@
+
+---
+# 结果：执行完成返回信息
+bool success           # 执行结果状态
+int32 final_state      # 最终状态
+string result_msg      # 结果描述
+---
+# 反馈：执行过程实时状态
+float32 progress       # 进度（0.0~1.0）
+int32 current_state    # 实时状态
+string feedback_msg    # 过程描述
+
+
+
+
