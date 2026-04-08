@@ -7,6 +7,7 @@ import time
 import threading
 import logging
 import queue
+import os
 import numpy as np
 import rclpy
 import tyro
@@ -22,6 +23,11 @@ from examples.H10W.robot_controller import RobotController
 from vla.action import ActionVLA
 
 from detection_client_3d import DetectionClient3DSync
+
+RUNNING = 2
+SUCCEEDED = 3
+FAILED = 4
+TIMEOUT = 5
 
 class Normalizer:
     def __init__(self, mode: str, statistics: dict):
@@ -126,9 +132,7 @@ def resolve_gripper(stable, last, holding, allow_release):
 
 
 class AsyncRTCInferenceWorker:
-    """
-    异步推理 + RTC chunk 切换辅助器。
-    """
+    """异步推理 worker，结果携带 request_id，防止串任务。"""
     def __init__(self, model, wait_timeout: float = ASYNC_WAIT_TIMEOUT):
         self.model = model
         self.wait_timeout = wait_timeout
@@ -141,12 +145,13 @@ class AsyncRTCInferenceWorker:
     def _run(self):
         while not self._stop_event.is_set():
             try:
-                example = self._request_q.get(timeout=0.1)
+                request = self._request_q.get(timeout=0.1)
             except queue.Empty:
                 continue
 
-            if example is None:
+            if request is None:
                 return
+            request_id, example = request
 
             try:
                 response = self.model.step(example)
@@ -156,17 +161,17 @@ class AsyncRTCInferenceWorker:
                         self._result_q.get_nowait()
                     except queue.Empty:
                         break
-                self._result_q.put(actions)
+                self._result_q.put((request_id, actions))
             except Exception as e:
-                logger.exception(f"[ASYNC INFER] inference failed: {e}")
+                logger.exception(f"[ASYNC INFER] inference failed for request_id={request_id}: {e}")
 
-    def request(self, example):
+    def request(self, example, request_id: int):
         while not self._request_q.empty():
             try:
                 self._request_q.get_nowait()
             except queue.Empty:
                 break
-        self._request_q.put(example)
+        self._request_q.put((request_id, example))
 
     def get_blocking(self):
         return self._result_q.get(timeout=self.wait_timeout)
@@ -186,6 +191,64 @@ class AsyncRTCInferenceWorker:
                 break
         self._request_q.put(None)
         self._thread.join(timeout=0.5)
+
+
+def _stable_switch_gripper(prev_seq, next_seq, channel_idx: int, k: int = 3):
+    if len(prev_seq) == 0 or len(next_seq) == 0:
+        return np.array([], dtype=np.float32)
+    prev_vals = np.rint(np.asarray(prev_seq[:, channel_idx])).astype(np.int32)
+    next_vals = np.rint(np.asarray(next_seq[:, channel_idx])).astype(np.int32)
+    switched = prev_vals.copy()
+    if len(next_vals) < k:
+        return switched.astype(np.float32)
+    for i in range(len(switched)):
+        cur = prev_vals[i]
+        if i + k <= len(next_vals):
+            window = next_vals[i:i + k]
+            if np.all(window == window[0]) and window[0] != cur:
+                switched[i:] = window[0]
+                break
+    return switched.astype(np.float32)
+
+
+def fuse_action_chunks(prev_remaining, next_actions, overlap, frozen):
+    """
+    prev_remaining: 当前 chunk 尚未执行的剩余部分
+    next_actions: 新推理得到的完整 chunk
+    overlap: 重叠融合步数
+    frozen: 旧 chunk 尾部保留步数
+    return: fused_actions
+    """
+    if prev_remaining is None or len(prev_remaining) == 0:
+        return next_actions
+    if next_actions is None or len(next_actions) == 0:
+        return prev_remaining
+
+    prev_remaining = np.asarray(prev_remaining, dtype=np.float32)
+    next_actions = np.asarray(next_actions, dtype=np.float32)
+
+    frozen = max(0, min(int(frozen), prev_remaining.shape[0]))
+    available_prev = max(0, prev_remaining.shape[0] - frozen)
+    actual_overlap = max(0, min(int(overlap), available_prev, next_actions.shape[0]))
+
+    frozen_keep = prev_remaining[:frozen]
+    if actual_overlap <= 0:
+        return np.concatenate([frozen_keep, next_actions], axis=0)
+
+    prev_overlap = prev_remaining[frozen:frozen + actual_overlap].copy()
+    next_overlap = next_actions[:actual_overlap].copy()
+    overlap_fused = prev_overlap.copy()
+
+    continuous_idx = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+    alphas = np.linspace(0.0, 1.0, actual_overlap, dtype=np.float32)
+    for t, alpha in enumerate(alphas):
+        overlap_fused[t, continuous_idx] = (1.0 - alpha) * prev_overlap[t, continuous_idx] + alpha * next_overlap[t, continuous_idx]
+
+    overlap_fused[:, 7] = _stable_switch_gripper(prev_overlap, next_overlap, channel_idx=7, k=3)
+    overlap_fused[:, 15] = _stable_switch_gripper(prev_overlap, next_overlap, channel_idx=15, k=3)
+
+    suffix = next_actions[actual_overlap:]
+    return np.concatenate([frozen_keep, overlap_fused, suffix], axis=0)
 
 frozen_left_rgb = cv2.imread("/home/diana/intern-vla_test/starVLA/debug_images/left.png")
 frozen_right_rgb = cv2.imread("/home/diana/intern-vla_test/starVLA/debug_images/right.png")
@@ -225,8 +288,7 @@ class Args:
     else:
         resize_size = [224, 224]
 
-stats = load_stats("/home/diana/intern-vla_test/starVLA/results/Checkpoints/gr00t_data_latest_sofa_v2_finetune/dataset_statistics.json")
-normalizer = Normalizer("min_max", stats) 
+normalizer = None
 
 def wait_for_goal_handle(interface, timeout=2.0):
     start = time.time()
@@ -271,7 +333,7 @@ def finish_task_with_failure(interface, msg: str, error_code: int = 1, timeout: 
 
     result = ActionVLA.Result()
     result.success = False
-    result.final_state = 3   # 失败，不要再用 3
+    result.final_state = FAILED
     result.error_code = error_code
     result.result_msg = msg
 
@@ -279,7 +341,7 @@ def finish_task_with_failure(interface, msg: str, error_code: int = 1, timeout: 
         interface._result_msg = result
         interface._done_event.set()
 
-    interface.vla_status["status"] = 3
+    interface.vla_status["status"] = FAILED
     interface.new_task_flag = False
     logger.error(msg)
     return True
@@ -536,18 +598,19 @@ def choose_available_hand(detected_hand: str):
 
 
 def prepare_policy_example(interface, robot_controller, task_description: str):
+    global normalizer
     obs = interface.get_observations()
     if obs is None:
         return None
 
-    head_img = obs["head_rgb"]["data"]
-    left_img = obs["left_rgb"]["data"]
-    right_img = obs["right_rgb"]["data"]
+    head_img = obs["head_rgb"]["data"].copy()
+    left_img = obs["left_rgb"]["data"].copy()
+    right_img = obs["right_rgb"]["data"].copy()
 
     if freeze_left_image:
-        left_img = frozen_left_rgb
+        left_img = frozen_left_rgb.copy()
     if freeze_right_image:
-        right_img = frozen_right_rgb
+        right_img = frozen_right_rgb.copy()
 
     images = [head_img, left_img, right_img]
 
@@ -555,13 +618,16 @@ def prepare_policy_example(interface, robot_controller, task_description: str):
     if robot_status is None:
         return None
 
-    left_arm_joints = robot_status['leftjoint']
-    if "white-desk" in interface.target_location:
+    left_arm_joints = list(robot_status["leftjoint"])
+    target_location_snapshot = str(interface.target_location or "")
+    if "white-desk" in target_location_snapshot:
         left_arm_joints[2] += 0.1
         left_arm_joints[3] += 0.02
-    right_arm_joints = robot_status['rightjoint']
-    left_gripper_state = robot_status['left_gripper']
-    right_gripper_state = robot_status['right_gripper']
+    right_arm_joints = list(robot_status["rightjoint"])
+    left_gripper_state = list(robot_status["left_gripper"])
+    right_gripper_state = list(robot_status["right_gripper"])
+    current_item_snapshot = str(interface.current_item) if interface.current_item is not None else ""
+    task_description_snapshot = str(task_description)
 
     state = np.array(left_arm_joints + left_gripper_state + right_arm_joints + right_gripper_state)
     state_tensor = torch.tensor(state, dtype=torch.float32)
@@ -570,7 +636,7 @@ def prepare_policy_example(interface, robot_controller, task_description: str):
 
     example = {
         "image": images,
-        "lang": task_description,
+        "lang": task_description_snapshot,
         "state": state,
     }
 
@@ -578,551 +644,362 @@ def prepare_policy_example(interface, robot_controller, task_description: str):
         "example": example,
         "left_arm_joints": left_arm_joints,
         "right_arm_joints": right_arm_joints,
-        "current_item": interface.current_item,
+        "left_gripper_state": left_gripper_state,
+        "right_gripper_state": right_gripper_state,
+        "current_item_snapshot": current_item_snapshot,
+        "task_description_snapshot": task_description_snapshot,
+        "target_location_snapshot": target_location_snapshot,
     }
 
-def main(args: Args):
+
+def get_current_control_state(robot_controller, target_location: str):
+    robot_status = robot_controller.get_status()
+    if robot_status is None:
+        return None
+    left_arm_joints = list(robot_status["leftjoint"])
+    if "white-desk" in target_location:
+        left_arm_joints[2] += 0.1
+        left_arm_joints[3] += 0.02
+    return {
+        "left_arm_joints": left_arm_joints,
+        "right_arm_joints": list(robot_status["rightjoint"]),
+        "left_gripper_state": list(robot_status["left_gripper"]),
+        "right_gripper_state": list(robot_status["right_gripper"]),
+        "leftPose": robot_status.get("leftPose", None),
+        "rightPose": robot_status.get("rightPose", None),
+    }
+
+def execute_single_task(
+    args: Args,
+    interface,
+    robot_controller,
+    model,
+    detector_client,
+    task_description: str,
+):
     global left_hand_holding, right_hand_holding
     global allow_left_release, allow_right_release
     global last_left_gripper, last_right_gripper
     global left_grasp_counter, right_grasp_counter
     global left_place_done, right_place_done
-    global left_item_name,right_item_name
+    global left_item_name, right_item_name
     global use_left, use_right
-    global freeze_left_image,freeze_right_image
-    
-    # ===============================
-    # frozen wrist image buffer
-    # ===============================
+    global freeze_left_image, freeze_right_image
 
-    hold_left_joint = None
-    hold_right_joint = None
+    task_complate = False
+    action_finished = False
+    FINISH_HOLD_TIME = 0.5
+    finish_start_time = None
+    left_target_pose = np.array([0.60, 0.60, 1.21])
+    current_request_id = 0
+    target_location = interface.target_location or ""
+    interface.vla_status["status"] = RUNNING
+    async_worker = AsyncRTCInferenceWorker(model, wait_timeout=ASYNC_WAIT_TIMEOUT)
+    try:
+        if "pick" not in task_description and "place" not in task_description:
+            robot_controller.h10w_system.enableController(True)
+            robot_controller.control_torso(torso=0.54)
+            robot_controller.h10w_system.enableController(False)
+            interface.vla_status["status"] = SUCCEEDED
+            return True, SUCCEEDED, "Task finished"
 
+        if "sofa" in target_location:
+            robot_controller.h10w_system.enableController(True)
+            robot_controller.control_torso(torso=0.24)
+            robot_controller.h10w_system.enableController(False)
+            left_target_pose[2] = 0.9
+        elif "TV-cabinet" in target_location:
+            robot_controller.h10w_system.enableController(True)
+            robot_controller.control_torso(torso=0.34)
+            robot_controller.h10w_system.enableController(False)
+            left_target_pose[2] = 1.0
+        else:
+            left_target_pose[2] = 1.21
+
+        if "place" in task_description.lower() and "left" not in task_description.lower() and "right" not in task_description.lower():
+            place_ret = infer_place_hand_and_rewrite_instruction(task_description)
+            if not place_ret["success"]:
+                finish_task_with_failure(interface, msg=place_ret["reason"], error_code=-1)
+                return False, FAILED, place_ret["reason"]
+            task_description = place_ret["new_instruction"]
+            interface.latest_instruction = task_description
+
+        if "pick" in task_description.lower() and "left" not in task_description.lower() and "right" not in task_description.lower():
+            infer_ret = infer_hand_and_rewrite_instruction(
+                interface=interface,
+                robot_controller=robot_controller,
+                detector_client=detector_client,
+                task_description=task_description,
+                target_location=target_location,
+                save_debug=False,
+            )
+            if not infer_ret["success"]:
+                finish_task_with_failure(interface, msg=infer_ret["reason"], error_code=-7)
+                return False, FAILED, infer_ret["reason"]
+            task_description = infer_ret["new_instruction"]
+            interface.latest_instruction = task_description
+
+        allow_left_release = "left" in task_description if "place" in task_description else allow_left_release
+        allow_right_release = "right" in task_description if "place" in task_description else allow_right_release
+        if "place" in task_description and ("left" not in task_description and "right" not in task_description):
+            allow_left_release = True
+            allow_right_release = True
+
+        use_left = "left" in task_description
+        use_right = "right" in task_description
+        if not use_left and not use_right:
+            use_left = True
+            use_right = True
+
+        freeze_left_image = "right" in task_description
+        freeze_right_image = "left" in task_description
+        left_action_buffer.clear()
+        right_action_buffer.clear()
+        step_counter = 0
+        task_start_time = time.time()
+
+        robot_controller.h10w_system.enableController(True)
+        robot_controller.h10w_motion.enableRealtimeCmd(True)
+
+        prepared = None
+        while prepared is None:
+            prepared = prepare_policy_example(interface, robot_controller, task_description)
+            if prepared is None:
+                time.sleep(0.001)
+        current_item_snapshot = prepared["current_item_snapshot"]
+        current_request_id += 1
+        async_worker.request(prepared["example"], current_request_id)
+        first_req, current_actions = async_worker.get_blocking()
+        if first_req != current_request_id:
+            raise RuntimeError("initial async request_id mismatch")
+
+        logger.info(
+            f"[RTC CONFIG] CONTROL_DT={CONTROL_DT}, RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
+            f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}, ACTION_HORIZON={current_actions.shape[0]}"
+        )
+        if current_actions.shape[0] < 32:
+            logger.warning("RTC is enabled but action chunk length < 32; smooth fusion quality may be limited.")
+
+        while not task_complate:
+            actions = current_actions
+            exec_steps = actions.shape[0]
+            rtc_trigger_idx = max(0, exec_steps - RTC_OVERLAP)
+            rtc_swap_idx = min(exec_steps - 1, rtc_trigger_idx + RTC_FROZEN)
+            async_requested = False
+            switched = False
+            pending_request_id = None
+            next_chunk_item_snapshot = current_item_snapshot
+
+            for i in range(exec_steps):
+                start = time.time()
+                step_counter += 1
+
+                if time.time() - task_start_time > TASK_TIMEOUT:
+                    interface.vla_status["status"] = TIMEOUT
+                    return False, TIMEOUT, "Task timeout"
+                if interface.vla_status.get("status") == FAILED:
+                    return False, FAILED, "Task failed by status flag"
+
+                state = get_current_control_state(robot_controller, target_location)
+                if state is None or state["leftPose"] is None or state["rightPose"] is None:
+                    finish_task_with_failure(interface, "Robot pose unavailable", error_code=-9)
+                    return False, FAILED, "Robot pose unavailable"
+
+                if (not async_requested) and i >= rtc_trigger_idx:
+                    next_prepared = prepare_policy_example(interface, robot_controller, task_description)
+                    if next_prepared is not None:
+                        current_request_id += 1
+                        pending_request_id = current_request_id
+                        next_chunk_item_snapshot = next_prepared["current_item_snapshot"]
+                        async_worker.request(next_prepared["example"], pending_request_id)
+                        async_requested = True
+
+                act = actions[i]
+                left_arm_joints = np.array(state["left_arm_joints"], dtype=np.float32)
+                right_arm_joints = np.array(state["right_arm_joints"], dtype=np.float32)
+                if "delta" in args.pretrained_path:
+                    left_arm = left_arm_joints + np.array(act[0:7])
+                    right_arm = right_arm_joints + np.array(act[8:15])
+                else:
+                    left_arm = np.array(act[0:7], dtype=np.float32)
+                    right_arm = np.array(act[8:15], dtype=np.float32)
+                if "white-desk" in target_location:
+                    left_arm[2] -= 0.1
+                    left_arm[3] -= 0.02
+
+                left_grip_raw = int(act[7])
+                right_grip_raw = int(act[15])
+                stable_left = smooth_gripper(left_action_buffer, left_grip_raw)
+                stable_right = smooth_gripper(right_action_buffer, right_grip_raw)
+                last_left_gripper = resolve_gripper(stable_left, last_left_gripper, left_hand_holding, allow_left_release)
+                last_right_gripper = resolve_gripper(stable_right, last_right_gripper, right_hand_holding, allow_right_release)
+
+                robot_controller.control_joints(
+                    left_arm=left_arm.tolist(),
+                    right_arm=right_arm.tolist(),
+                    left_gripper=last_left_gripper,
+                    right_gripper=last_right_gripper,
+                    control_time=CONTROL_DT,
+                )
+
+                right_target_pose = left_target_pose.copy()
+                right_target_pose[1] *= -1
+                dl = np.linalg.norm(np.array(state["leftPose"][:3]) - left_target_pose[:3])
+                dr = np.linalg.norm(np.array(state["rightPose"][:3]) - right_target_pose[:3])
+                both_close = (dl < 0.1 and dr < 0.1)
+                if both_close and step_counter > 300:
+                    if finish_start_time is None:
+                        finish_start_time = time.time()
+                    elif time.time() - finish_start_time >= FINISH_HOLD_TIME:
+                        interface.vla_status["status"] = SUCCEEDED
+                        task_complate = True
+                        action_finished = True
+                        break
+
+                if not left_hand_holding:
+                    if last_left_gripper == 1:
+                        left_grasp_counter += 1
+                        if left_grasp_counter >= 50 and left_item_name == "":
+                            left_item_name = current_item_snapshot
+                        if left_grasp_counter >= GRASP_CONFIRM_STEPS:
+                            left_hand_holding = True
+                            left_grasp_counter = GRASP_CONFIRM_STEPS
+                    else:
+                        left_grasp_counter = 0
+                else:
+                    left_grasp_counter = GRASP_CONFIRM_STEPS
+                if allow_left_release and last_left_gripper == 0:
+                    left_hand_holding = False
+                    left_place_done = True
+                    left_item_name = ""
+                    left_grasp_counter = 0
+
+                if not right_hand_holding:
+                    if last_right_gripper == 1:
+                        right_grasp_counter += 1
+                        if right_grasp_counter >= 50 and right_item_name == "":
+                            right_item_name = current_item_snapshot
+                        if right_grasp_counter >= GRASP_CONFIRM_STEPS:
+                            right_hand_holding = True
+                            right_grasp_counter = GRASP_CONFIRM_STEPS
+                    else:
+                        right_grasp_counter = 0
+                else:
+                    right_grasp_counter = GRASP_CONFIRM_STEPS
+                if allow_right_release and last_right_gripper == 0:
+                    right_hand_holding = False
+                    right_place_done = True
+                    right_item_name = ""
+                    right_grasp_counter = 0
+
+                interface.vla_status["left_state"] = 1 if left_hand_holding else 0
+                interface.vla_status["right_state"] = 1 if right_hand_holding else 0
+                interface.vla_status["left_item"] = left_item_name
+                interface.vla_status["right_item"] = right_item_name
+                interface.vla_status["status"] = RUNNING
+
+                if async_requested and i >= rtc_swap_idx and pending_request_id is not None:
+                    got = async_worker.get_latest_nowait()
+                    if got is not None:
+                        req_id, next_actions = got
+                        if req_id == pending_request_id:
+                            prev_remaining = actions[i + 1:]
+                            current_actions = fuse_action_chunks(prev_remaining, next_actions, overlap=RTC_OVERLAP, frozen=RTC_FROZEN)
+                            current_item_snapshot = next_chunk_item_snapshot
+                            switched = True
+                            break
+                time.sleep(max(0.0, CONTROL_DT - (time.time() - start)))
+
+            if task_complate:
+                break
+            if switched:
+                continue
+            if async_requested and pending_request_id is not None:
+                try:
+                    req_id, next_actions = async_worker.get_blocking()
+                    if req_id == pending_request_id:
+                        current_actions = fuse_action_chunks(actions[-1:, ...], next_actions, overlap=RTC_OVERLAP, frozen=1)
+                        current_item_snapshot = next_chunk_item_snapshot
+                    else:
+                        current_actions = actions[-1:, ...]
+                except Exception as e:
+                    logger.warning(f"[RTC] async next chunk timeout, fallback hold-last-action: {e}")
+                    current_actions = actions[-1:, ...]
+            else:
+                current_actions = actions[-1:, ...]
+
+        if interface.vla_status.get("status") == SUCCEEDED:
+            return True, SUCCEEDED, "Task finished"
+        if interface.vla_status.get("status") == TIMEOUT:
+            return False, TIMEOUT, "Task timeout"
+        return False, FAILED, "Task failed"
+    finally:
+        async_worker.stop()
+        robot_controller.init_left()
+        robot_controller.init_right()
+        robot_controller.h10w_motion.enableRealtimeCmd(False)
+        robot_controller.h10w_system.enableController(False)
+        use_left = False
+        use_right = False
+        allow_left_release = False
+        allow_right_release = False
+        freeze_left_image = False
+        freeze_right_image = False
+
+
+def main(args: Args):
+    global normalizer
     rclpy.init()
+    stats_path = os.path.join(args.pretrained_path, "dataset_statistics.json")
+    if not os.path.exists(stats_path):
+        raise FileNotFoundError(f"dataset statistics not found: {stats_path}")
+    stats = load_stats(stats_path)
+    normalizer = Normalizer("min_max", stats)
 
     robot_controller = RobotController()
-    interface = H10WInterface(H10WInferfaceConfig(),robot_controller)
+    interface = H10WInterface(H10WInferfaceConfig(), robot_controller)
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(interface)
     threading.Thread(target=executor.spin, daemon=True).start()
-    print("[INFO] ROS Executor started. Waiting for camera topics...")
+    logger.info("ROS Executor started. Waiting for camera topics...")
     time.sleep(1.0)
-    
+
     model = ModelClient(
         policy_ckpt_path=args.pretrained_path,
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
     )
-
     detector_client = DetectionClient3DSync("ws://10.8.26.11:8000")
+    logger.info(
+        f"Runtime config: CONTROL_DT={CONTROL_DT}, RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
+        f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}"
+    )
 
-    task_complate = False
-    action_finished = False
-    FINISH_HOLD_TIME = 0.5  # 连续 0.5 秒满足条件
-    finish_start_time = None
-
-    left_target_pose = np.array([0.60, 0.60, 1.21])
-
-    try:
-        while True:
-            task_description = interface.latest_instruction
-            if task_description is None:
-                time.sleep(0.01)
-                continue
-            
-            if not interface.new_task_flag:
-                time.sleep(0.01)
-                continue
-
-            # ===============================
-            # 非 pick / place 任务直接完成
-            # ===============================
-            if "pick" not in task_description and "place" not in task_description:
-                if not wait_for_goal_handle(interface):
-                    logger.error("execute_goal_callback not started yet, cannot send result")
-                    continue
-                torso = 0.54
-                ret = robot_controller.h10w_system.enableController(True)
-                robot_controller.control_torso(torso=torso)
-                ret = robot_controller.h10w_system.enableController(False)
-                # if interface._current_goal_handle is not None:
-                # logger.info(f"{interface._current_goal_handle}")
-                result = ActionVLA.Result()
-                result.success = True
-                result.final_state = 3
-                result.error_code = 0
-                result.result_msg = "Task finished"
-                with interface._lock:
-                    interface._result_msg = result
-                    interface._done_event.set()
-                interface.new_task_flag = False
-                logger.info("*" * 80)
-                logger.info("Task finished")
-                continue
-
-            if "sofa" in interface.target_location:
-                torso = 0.26 - 0.02
-                ret = robot_controller.h10w_system.enableController(True)
-                robot_controller.control_torso(torso=torso)
-                ret = robot_controller.h10w_system.enableController(False)
-                left_target_pose[2]= 0.9
-            elif "TV-cabinet" in interface.target_location:
-                torso = 0.34
-                ret = robot_controller.h10w_system.enableController(True)
-                robot_controller.control_torso(torso=torso)
-                ret = robot_controller.h10w_system.enableController(False)
-                left_target_pose[2]= 1.0
-            else:
-                left_target_pose[2] = 1.21
-            
-            if action_finished:
-                task_complate = False
-                finish_start_time = None
-                step_counter = 0
-                left_action_buffer.clear()
-                right_action_buffer.clear()
-                action_finished = False
-                
-            # ===============================
-            # place 任务：只允许对应手放
-            # ===============================
-            if (
-                "place" in task_description.lower()
-                and "left" not in task_description.lower()
-                and "right" not in task_description.lower()
-            ):
-                place_ret = infer_place_hand_and_rewrite_instruction(task_description)
-
-                if not place_ret["success"]:
-                    finish_task_with_failure(
-                        interface,
-                        msg=place_ret["reason"],
-                        error_code=-1,
-                    )
-                    # result = ActionVLA.Result()
-                    # result.success = False
-                    # result.final_state = 3
-                    # result.error_code = 0
-                    # result.result_msg = "No traget object "
-                    # with interface._lock:
-                    #     interface._result_msg = result
-                    #     interface._done_event.set()
-                    # interface.new_task_flag = False
-                    continue
-
-                logger.info(
-                    f"[PLACE HAND INFER] object={place_ret['object_name']}, "
-                    f"hand={place_ret['hand']}, "
-                    f"new_instruction={place_ret['new_instruction']}"
-                )
-
-                task_description = place_ret["new_instruction"]
-                interface.latest_instruction = task_description
-            
-            if "place" in task_description:
-                allow_left_release = "left" in task_description
-                allow_right_release = "right" in task_description
-                if "left" not in task_description and "right" not in task_description:
-                    allow_left_release = True
-                    allow_right_release = True
-                left_place_done = False
-                right_place_done = False
-            
-            if (
-                "pick" in task_description.lower()
-                and "left" not in task_description.lower()
-                and "right" not in task_description.lower()
-            ):
-                infer_ret = infer_hand_and_rewrite_instruction(
-                    interface=interface,
-                    robot_controller=robot_controller,
-                    detector_client=detector_client,
-                    task_description=task_description,
-                    target_location=interface.target_location if interface.target_location is not None else "",
-                    save_debug=False,
-                )
-
-                if not infer_ret["success"]:
-                    finish_task_with_failure(
-                        interface,
-                        msg=infer_ret["reason"],
-                        error_code=-7,
-                    )
-                    # result = ActionVLA.Result()
-                    # result.success = False
-                    # result.final_state = 3
-                    # result.error_code = 0
-                    # result.result_msg = "No traget object "
-                    # with interface._lock:
-                    #     interface._result_msg = result
-                    #     interface._done_event.set()
-                    # interface.new_task_flag = False
-                    
-                    # finish_task_with_failure(
-                    #     interface,
-                    #     msg=infer_ret["reason"],
-                    #     error_code=1001,
-                    # )
-                    continue
-
-                logger.info(
-                    f"[HAND DETECT] object={infer_ret['object_name']}, "
-                    f"hand={infer_ret['hand']}, "
-                    f"new_instruction={infer_ret['new_instruction']}"
-                )
-
-                time.sleep(1)
-
-                task_description = infer_ret["new_instruction"]
-                interface.latest_instruction = task_description
-
-            
-            if "left" in task_description:
-                use_left = True
-            if "right" in task_description:
-                use_right = True
-
-            #left/right，默认双手都可用
-            if not use_left and not use_right:
-                use_left = True
-                use_right = True
-            task_start_time = time.time()
-
-            # if "pick" in task_description:
-            #     if "left" in task_description and last_right_gripper==1:
-            #         ret = robot_controller.h10w_system.enableController(True)
-            #         robot_controller.control_lpose()
-            #         ret = robot_controller.h10w_system.enableController(False)
-            #     if "right" in task_description and last_left_gripper==1:
-            #         ret = robot_controller.h10w_system.enableController(True)
-            #         robot_controller.control_rpose()
-            #         ret = robot_controller.h10w_system.enableController(False)
-                
-            # 任务开始
-            ret = robot_controller.h10w_system.enableController(True)
-            ret = robot_controller.h10w_motion.enableRealtimeCmd(True)
-            step_counter = 0
-
-            # if "pick" in task_description:
-            if "left" in task_description:
-                freeze_right_image = True  
-            if "right" in task_description:
-                freeze_left_image = True 
-            
-            task_start_time = time.time()
-            async_worker = AsyncRTCInferenceWorker(model)
-            prepared = None
-            while prepared is None:
-                prepared = prepare_policy_example(interface, robot_controller, task_description)
-                if prepared is None:
-                    time.sleep(0.001)
-            async_worker.request(prepared["example"])
-
-            try:
-                current_actions = async_worker.get_blocking()
-            except Exception:
-                async_worker.stop()
-                finish_task_with_failure(interface, msg="初始推理失败", error_code=-8)
-                continue
-
-            while not task_complate:
-                # ==========================
-                # 任务超时判断
-                # ==========================
-                if time.time() - task_start_time > TASK_TIMEOUT:
-                    print("[WARN] Task timeout! Returning to home position...")
-                    robot_status = robot_controller.get_status()
-                    lpose = robot_status.get("leftPose", None)
-                    rpose = robot_status.get("rightPose", None)
-                    
-                    if "left" in task_description:
-                        left_hand_holding = False
-                        left_item_name = ""
-                        left_grasp_counter = 0
-                        allow_left_release = False
-                        left_place_done = False 
-                        robot_controller.control_lpose(lpose)
-                        robot_controller.init_left()
-                    
-                    if "right" in task_description:
-                        right_hand_holding = False
-                        right_item_name = ""
-                        right_grasp_counter = 0
-                        allow_right_release = False
-                        right_place_done = False
-                        robot_controller.control_rpose(rpose)
-                        robot_controller.init_right()
-
-                    # 如果任务要求双手（如 pick-up apple）
-                    if ("left" not in task_description) and ("right" not in task_description):
-                        # 默认认为是双手任务
-                        left_hand_holding = False
-                        left_item_name = ""
-                        left_grasp_counter = 0
-                        allow_left_release = False
-                        left_place_done = False
-                        robot_controller.control_lpose(lpose)
-
-                        right_hand_holding = False
-                        right_item_name = ""
-                        right_grasp_counter = 0
-                        allow_right_release = False
-                        right_place_done = False
-                        robot_controller.control_rpose(rpose)
-                        
-                    interface.vla_status["left_state"] = 1 if left_hand_holding else 0
-                    interface.vla_status["right_state"] = 1 if right_hand_holding else 0
-                    interface.vla_status["left_item"] = left_item_name
-                    interface.vla_status["right_item"] = right_item_name
-                    
-                    interface.vla_status["status"] = 3   # 3 = 完成
-                    task_complate = True
-                    action_finished = True
-                    break
-                    
-                robot_status = robot_controller.get_status()
-                if robot_status is None:
-                    time.sleep(0.001)
-                    continue
-                lpose = robot_status.get("leftPose", None)
-                rpose = robot_status.get("rightPose", None)
-                if lpose is None or rpose is None:
-                    return False
-                
-                right_target_pose = left_target_pose.copy()
-                right_target_pose[1] *= -1
-
-                dl = np.linalg.norm(np.array(lpose[:3]) - left_target_pose[:3])
-                dr = np.linalg.norm(np.array(rpose[:3]) - right_target_pose[:3])
-                both_close = (dl < 0.1 and dr < 0.1)
-
-                if both_close and step_counter > 300:
-                    if finish_start_time is None:
-                        finish_start_time = time.time()
-                    elif time.time() - finish_start_time >= FINISH_HOLD_TIME:
-                        print("[INFO] Task finished by end-effector pose")
-                        interface.vla_status["status"] = 3   # 3 = 完成
-                        task_complate = True
-                        action_finished = True
-                         # ===============================
-                        # 根据夹爪状态刷新 holding 状态
-                        # ===============================
-                        if last_left_gripper == 1:
-                            left_hand_holding = True
-                        else:
-                            left_hand_holding = False
-                            
-                        
-                        if last_right_gripper == 1:
-                            right_hand_holding = True
-                        else:
-                            right_hand_holding = False
-                            
-
-                        # ===============================
-                        # 统一刷新 vla_status，用最终值
-                        # ===============================
-                        interface.vla_status["left_state"] = 1 if left_hand_holding else 0
-                        interface.vla_status["right_state"] = 1 if right_hand_holding else 0
-                        time.sleep(1)
-                        
-                        break
-
-                actions = current_actions
-
-                interface.vla_status["status"] = 2
-
-                exec_steps = actions.shape[0]- 0
-                rtc_trigger_idx = max(0, exec_steps - RTC_OVERLAP)
-                rtc_swap_idx = min(exec_steps - 1, rtc_trigger_idx + RTC_FROZEN)
-                async_requested = False
-                switched_to_next_chunk = False
-
-                for i in range(exec_steps):
-                    act = actions[i]
-                    start = time.time()
-                    step_counter += 1
-
-                    if (not async_requested) and i >= rtc_trigger_idx:
-                        next_prepared = prepare_policy_example(interface, robot_controller, task_description)
-                        if next_prepared is not None:
-                            async_worker.request(next_prepared["example"])
-                            async_requested = True
-
-                    current_item = interface.current_item
-                    prep_for_delta = prepare_policy_example(interface, robot_controller, task_description)
-                    if prep_for_delta is not None:
-                        left_arm_joints = prep_for_delta["left_arm_joints"]
-                        right_arm_joints = prep_for_delta["right_arm_joints"]
-                    
-                    # delta OR absolute
-                    if "delta" in Args.pretrained_path:
-                        left_delta = np.array(act[0:7])
-                        right_delta = np.array(act[8:15])
-
-                        left_arm = left_arm_joints + left_delta
-                        right_arm = right_arm_joints + right_delta
-                    else:  
-                        left_arm = act[0:7]
-                        right_arm = act[8:15]
-                    
-                    # white desk offset
-                    if "white-desk" in interface.target_location:
-                        left_arm[2] -= 0.1
-                        left_arm[3] -= 0.02
-
-                    left_arm = left_arm.tolist()
-                    right_arm = right_arm.tolist()
-
-                    left_grip_raw = int(act[7])
-                    right_grip_raw = int(act[15])
-                    
-                    stable_left = smooth_gripper(left_action_buffer, left_grip_raw)
-                    stable_right = smooth_gripper(right_action_buffer, right_grip_raw)
-                    
-                    # print("stable_left:",stable_left)
-                    # print("stable_right:",stable_right)
-
-                    # print("left_hand_holding:",left_hand_holding)
-                    # print("right_hand_holding:",right_hand_holding)
-
-                    # print("allow_left_release:",allow_left_release)
-                    # print("allow_right_release:",allow_right_release)
-
-                    last_left_gripper = resolve_gripper(
-                        stable_left, last_left_gripper,
-                        left_hand_holding, allow_left_release
-                    )
-
-                    last_right_gripper = resolve_gripper(
-                        stable_right, last_right_gripper,
-                        right_hand_holding, allow_right_release
-                    )
-                    
-                    # print("last_left_gripper:",last_left_gripper)
-                    # print("last_right_gripper:",last_right_gripper)
-
-                    
-                    robot_controller.control_joints(
-                    left_arm=left_arm,
-                    right_arm=right_arm,
-                    left_gripper=last_left_gripper,
-                    right_gripper=last_right_gripper,
-                    control_time=CONTROL_DT,
-                    )
-
-                    time.sleep(max(0.0, CONTROL_DT - (time.time() - start)))
-                    
-                    if not left_hand_holding:
-                        if last_left_gripper == 1:
-                            left_grasp_counter += 1
-                            # 第一次从“没 holding” → “holding”的那一刻立即绑定 item_name
-                            if (not left_hand_holding) and left_grasp_counter >= 50 and left_item_name == "":
-                                left_item_name = current_item           # 立即绑定物品，不等 150 步
-                            if left_grasp_counter >= GRASP_CONFIRM_STEPS:
-                                left_hand_holding = True
-                                left_grasp_counter = GRASP_CONFIRM_STEPS
-                        else:
-                            left_grasp_counter = 0
-                    else:
-                        # 已经 holding，绝对不更新 item
-                        left_grasp_counter = GRASP_CONFIRM_STEPS
-
-                    # if allow_left_release and left_hand_holding and last_left_gripper == 0:
-                    if allow_left_release and last_left_gripper == 0:
-                        left_hand_holding = False
-                        # allow_left_release = False
-                        left_place_done = True
-                        left_item_name = ""
-                        left_grasp_counter = 0  
-
-                    if not right_hand_holding:
-                        if last_right_gripper == 1:
-                            right_grasp_counter += 1
-                            # 第一次从“没 holding” → “holding”的那一刻立即绑定 item_name
-                            if (not right_hand_holding) and right_grasp_counter >= 50 and right_item_name == "":
-                                right_item_name = current_item           # 立即绑定物品，不等 150 步
-                            if right_grasp_counter >= GRASP_CONFIRM_STEPS:
-                                right_hand_holding = True
-                                right_grasp_counter = GRASP_CONFIRM_STEPS
-                        else:
-                            right_grasp_counter = 0
-                    else:
-                        right_grasp_counter = GRASP_CONFIRM_STEPS
-
-
-                    # if allow_right_release and right_hand_holding and last_right_gripper == 0:
-                    if allow_right_release  and last_right_gripper == 0:
-                        right_hand_holding = False
-                        # allow_right_release = False
-                        right_place_done = True
-                        right_item_name = ""
-                        right_grasp_counter = 0
-
-                    
-                    interface.vla_status["left_state"] = 1 if left_hand_holding else 0
-                    interface.vla_status["right_state"] = 1 if right_hand_holding else 0
-                    interface.vla_status["left_item"] = left_item_name
-                    interface.vla_status["right_item"] = right_item_name
-
-                    if async_requested and i >= rtc_swap_idx:
-                        next_actions = async_worker.get_latest_nowait()
-                        if next_actions is not None:
-                            current_actions = next_actions
-                            switched_to_next_chunk = True
-                            break
-
-                if not switched_to_next_chunk:
-                    if async_requested:
-                        try:
-                            current_actions = async_worker.get_blocking()
-                        except Exception as e:
-                            logger.warning(f"[RTC] async next chunk not ready in time: {e}")
-                            # 兜底：继续使用当前 chunk 最后一步，避免 stop-and-go
-                            current_actions = actions[-1:, ...]
-                    else:
-                        # 没触发重叠请求（chunk 太短），补一次同步请求
-                        next_prepared = prepare_policy_example(interface, robot_controller, task_description)
-                        if next_prepared is not None:
-                            async_worker.request(next_prepared["example"])
-                            try:
-                                current_actions = async_worker.get_blocking()
-                            except Exception:
-                                current_actions = actions[-1:, ...]
-            
-            async_worker.stop()
-            
-            robot_controller.init_left()
-            robot_controller.init_right()
-            robot_controller.h10w_motion.enableRealtimeCmd(False)
-            robot_controller.h10w_system.enableController(False)
-
-            if interface.vla_status["status"] == 3 and interface._current_goal_handle is not None:
-                result = ActionVLA.Result()
-                result.success = True
-                result.final_state = 3
-                result.error_code = 0
-                result.result_msg = "Task finished"
-
-                with interface._lock:
-                    interface._result_msg = result
-                    interface._done_event.set()
-
-                interface.new_task_flag = False
-                task_complate = False
-                action_finished = False
-                finish_start_time = None
-                step_counter = 0
-                use_left = False
-                use_right = False
-                allow_left_release = False
-                allow_right_release = False
-                freeze_left_image = False
-                freeze_right_image = False
-
-    except KeyboardInterrupt:
-        print("Shutting down...")
+    while True:
+        task_description = interface.latest_instruction
+        if task_description is None or not interface.new_task_flag:
+            time.sleep(0.01)
+            continue
+        success, final_state, result_msg = execute_single_task(
+            args=args,
+            interface=interface,
+            robot_controller=robot_controller,
+            model=model,
+            detector_client=detector_client,
+            task_description=task_description,
+        )
+        if wait_for_goal_handle(interface):
+            result = ActionVLA.Result()
+            result.success = bool(final_state == SUCCEEDED and success)
+            result.final_state = final_state
+            result.error_code = 0 if result.success else 1
+            result.result_msg = result_msg
+            with interface._lock:
+                interface._result_msg = result
+                interface._done_event.set()
+        interface.vla_status["status"] = final_state
+        interface.new_task_flag = False
 
 
 if __name__ == "__main__":
