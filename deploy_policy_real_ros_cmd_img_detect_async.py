@@ -8,14 +8,13 @@ import threading
 import logging
 import queue
 import os
+import math
 import numpy as np
 import rclpy
 import tyro
 import torch
 import json
 import cv2
-
-from loguru import logger
 
 from examples.H10W.model2h10w_interface import ModelClient
 from examples.H10W.robot_interface import H10WInferfaceConfig, H10WInterface
@@ -75,6 +74,7 @@ TASK_TIMEOUT = 40.0  #
 RTC_OVERLAP = 8
 RTC_FROZEN = 4
 ASYNC_WAIT_TIMEOUT = 2.0
+MIN_FINISH_STEPS = 300
 
 # ===============================
 # gripper smoothing buffer
@@ -108,6 +108,7 @@ use_right = False
 # ===============================
 freeze_left_image = False
 freeze_right_image = False
+_warn_ts = {}
 
 def smooth_gripper(buffer, value):
     buffer.append(value)
@@ -131,16 +132,113 @@ def resolve_gripper(stable, last, holding, allow_release):
     return last
 
 
+def _rate_limited_warning(key: str, message: str, interval_sec: float = 2.0):
+    now = time.time()
+    last = _warn_ts.get(key, 0.0)
+    if now - last >= interval_sec:
+        logger.warning(message)
+        _warn_ts[key] = now
+
+
+def set_running_if_not_terminal(interface):
+    status = interface.vla_status.get("status")
+    if status in (FAILED, TIMEOUT, SUCCEEDED):
+        return False
+    interface.vla_status["status"] = RUNNING
+    return True
+
+
+def reset_per_task_execution_state():
+    global last_left_gripper, last_right_gripper
+    global left_grasp_counter, right_grasp_counter
+    global left_place_done, right_place_done
+    global allow_left_release, allow_right_release
+
+    left_action_buffer.clear()
+    right_action_buffer.clear()
+    last_left_gripper = 0
+    last_right_gripper = 0
+    left_grasp_counter = 0
+    right_grasp_counter = 0
+    left_place_done = False
+    right_place_done = False
+    allow_left_release = False
+    allow_right_release = False
+
+
+def check_task_completion(
+    use_left,
+    use_right,
+    left_pose,
+    right_pose,
+    left_target_pose,
+    right_target_pose,
+    step_counter,
+    finish_start_time,
+    finish_hold_time,
+):
+    dl = np.linalg.norm(np.array(left_pose[:3]) - left_target_pose[:3])
+    dr = np.linalg.norm(np.array(right_pose[:3]) - right_target_pose[:3])
+    left_close = dl < 0.1
+    right_close = dr < 0.1
+    if use_left and use_right:
+        completed = left_close and right_close
+    elif use_left:
+        completed = left_close
+    elif use_right:
+        completed = right_close
+    else:
+        completed = left_close and right_close
+
+    if completed and step_counter > MIN_FINISH_STEPS:
+        if finish_start_time is None:
+            finish_start_time = time.time()
+        elif time.time() - finish_start_time >= finish_hold_time:
+            return True, finish_start_time
+    else:
+        finish_start_time = None
+    return False, finish_start_time
+
+
 class AsyncRTCInferenceWorker:
-    """异步推理 worker，结果携带 request_id，防止串任务。"""
+    """异步推理 worker，带 task_epoch/request_id 隔离，防止串任务与旧结果污染。"""
     def __init__(self, model, wait_timeout: float = ASYNC_WAIT_TIMEOUT):
         self.model = model
         self.wait_timeout = wait_timeout
-        self._request_q = queue.Queue(maxsize=1)
-        self._result_q = queue.Queue(maxsize=1)
+        self._request_q = queue.Queue(maxsize=8)
+        self._result_q = queue.Queue(maxsize=32)
         self._stop_event = threading.Event()
+        self._meta_lock = threading.Lock()
+        self._closed = False
+        self._generation_id = 0
+        self._task_epoch = 0
+        self._latency_ema = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def _flush_queue(self, q):
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+    def start_new_task(self):
+        with self._meta_lock:
+            self._task_epoch += 1
+            task_epoch = self._task_epoch
+        self._flush_queue(self._request_q)
+        self._flush_queue(self._result_q)
+        return task_epoch
+
+    def get_recommended_frozen(self, control_dt: float, action_horizon: int, default_frozen: int):
+        with self._meta_lock:
+            latency = self._latency_ema
+        if latency is None or control_dt <= 0:
+            return int(default_frozen)
+        estimated = int(math.ceil(max(0.0, latency) / control_dt))
+        estimated = max(1, min(estimated, max(1, action_horizon - 1)))
+        return estimated
 
     def _run(self):
         while not self._stop_event.is_set():
@@ -151,45 +249,94 @@ class AsyncRTCInferenceWorker:
 
             if request is None:
                 return
-            request_id, example = request
+            req_generation, req_epoch, request_id, example = request
 
             try:
+                t0 = time.time()
                 response = self.model.step(example)
+                latency = time.time() - t0
+                with self._meta_lock:
+                    if self._latency_ema is None:
+                        self._latency_ema = latency
+                    else:
+                        self._latency_ema = 0.8 * self._latency_ema + 0.2 * latency
+                    closed = self._closed
+                    current_generation = self._generation_id
+                    current_epoch = self._task_epoch
+                if closed or req_generation != current_generation or req_epoch != current_epoch:
+                    logger.debug(
+                        f"[ASYNC INFER] drop stale in-flight result req={request_id}, "
+                        f"req_gen={req_generation}, cur_gen={current_generation}, "
+                        f"req_epoch={req_epoch}, cur_epoch={current_epoch}"
+                    )
+                    continue
                 actions = response["raw_actions"]
-                while not self._result_q.empty():
+                while self._result_q.full():
                     try:
                         self._result_q.get_nowait()
                     except queue.Empty:
                         break
-                self._result_q.put((request_id, actions))
+                self._result_q.put((req_epoch, request_id, actions))
             except Exception as e:
                 logger.exception(f"[ASYNC INFER] inference failed for request_id={request_id}: {e}")
 
-    def request(self, example, request_id: int):
-        while not self._request_q.empty():
+    def request(self, example, request_id: int, task_epoch: int):
+        with self._meta_lock:
+            if self._closed:
+                return False
+            gen = self._generation_id
+        while self._request_q.full():
             try:
                 self._request_q.get_nowait()
             except queue.Empty:
                 break
-        self._request_q.put((request_id, example))
+        self._request_q.put((gen, task_epoch, request_id, example))
+        return True
 
-    def get_blocking(self):
-        return self._result_q.get(timeout=self.wait_timeout)
+    def get_blocking_for_request(self, request_id: int, task_epoch: int, timeout: float = None):
+        timeout = self.wait_timeout if timeout is None else timeout
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(0.0, deadline - time.time())
+            try:
+                got_epoch, got_req, actions = self._result_q.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if got_epoch == task_epoch and got_req == request_id:
+                return got_req, actions
+            logger.debug(
+                f"[ASYNC INFER] discard non-matching result, got(epoch={got_epoch}, req={got_req}), "
+                f"expect(epoch={task_epoch}, req={request_id})"
+            )
+        raise queue.Empty(f"timeout waiting request_id={request_id}, task_epoch={task_epoch}")
 
-    def get_latest_nowait(self):
+    def get_latest_matching_request(self, request_id: int, task_epoch: int):
         latest = None
         while not self._result_q.empty():
-            latest = self._result_q.get_nowait()
+            try:
+                got_epoch, got_req, actions = self._result_q.get_nowait()
+            except queue.Empty:
+                break
+            if got_epoch == task_epoch and got_req == request_id:
+                latest = (got_req, actions)
+            else:
+                logger.debug(
+                    f"[ASYNC INFER] drop stale latest result got(epoch={got_epoch}, req={got_req}), "
+                    f"expect(epoch={task_epoch}, req={request_id})"
+                )
         return latest
 
     def stop(self):
+        with self._meta_lock:
+            self._closed = True
+            self._generation_id += 1
         self._stop_event.set()
-        while not self._request_q.empty():
-            try:
-                self._request_q.get_nowait()
-            except queue.Empty:
-                break
-        self._request_q.put(None)
+        self._flush_queue(self._request_q)
+        self._flush_queue(self._result_q)
+        try:
+            self._request_q.put_nowait(None)
+        except queue.Full:
+            pass
         self._thread.join(timeout=0.5)
 
 
@@ -601,16 +748,29 @@ def prepare_policy_example(interface, robot_controller, task_description: str):
     global normalizer
     obs = interface.get_observations()
     if obs is None:
+        _rate_limited_warning("prepare_obs_none", "prepare_policy_example skipped: obs is None")
         return None
+
+    required_keys = ["head_rgb", "left_rgb", "right_rgb"]
+    for key in required_keys:
+        if key not in obs or obs[key] is None or obs[key].get("data", None) is None:
+            _rate_limited_warning("prepare_obs_missing", f"prepare_policy_example skipped: missing {key}.data")
+            return None
 
     head_img = obs["head_rgb"]["data"].copy()
     left_img = obs["left_rgb"]["data"].copy()
     right_img = obs["right_rgb"]["data"].copy()
 
     if freeze_left_image:
-        left_img = frozen_left_rgb.copy()
+        if frozen_left_rgb is None:
+            _rate_limited_warning("freeze_left_missing", "left frozen image not available, keep live image")
+        else:
+            left_img = frozen_left_rgb.copy()
     if freeze_right_image:
-        right_img = frozen_right_rgb.copy()
+        if frozen_right_rgb is None:
+            _rate_limited_warning("freeze_right_missing", "right frozen image not available, keep live image")
+        else:
+            right_img = frozen_right_rgb.copy()
 
     images = [head_img, left_img, right_img]
 
@@ -655,7 +815,13 @@ def prepare_policy_example(interface, robot_controller, task_description: str):
 def get_current_control_state(robot_controller, target_location: str):
     robot_status = robot_controller.get_status()
     if robot_status is None:
+        _rate_limited_warning("robot_status_none", "robot status is None")
         return None
+    required = ["leftjoint", "rightjoint", "left_gripper", "right_gripper"]
+    for key in required:
+        if key not in robot_status or robot_status[key] is None:
+            _rate_limited_warning("robot_status_missing", f"robot status missing key: {key}")
+            return None
     left_arm_joints = list(robot_status["leftjoint"])
     if "white-desk" in target_location:
         left_arm_joints[2] += 0.1
@@ -667,6 +833,36 @@ def get_current_control_state(robot_controller, target_location: str):
         "right_gripper_state": list(robot_status["right_gripper"]),
         "leftPose": robot_status.get("leftPose", None),
         "rightPose": robot_status.get("rightPose", None),
+    }
+
+
+def sanitize_action(left_arm, right_arm, left_gripper, right_gripper, target_location):
+    left = np.asarray(left_arm, dtype=np.float32).reshape(-1)
+    right = np.asarray(right_arm, dtype=np.float32).reshape(-1)
+    if left.shape[0] != 7 or right.shape[0] != 7:
+        return {"valid": False, "reason": "invalid arm dof"}
+    if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+        return {"valid": False, "reason": "non-finite arm action"}
+
+    arm_min = np.array([-3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14], dtype=np.float32)
+    arm_max = np.array([3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14], dtype=np.float32)
+    left_clipped = np.clip(left, arm_min, arm_max)
+    right_clipped = np.clip(right, arm_min, arm_max)
+    if not np.allclose(left, left_clipped) or not np.allclose(right, right_clipped):
+        logger.warning(f"[SAFETY] arm action clipped for target_location={target_location}")
+
+    try:
+        lg = int(float(left_gripper) >= 0.5)
+        rg = int(float(right_gripper) >= 0.5)
+    except Exception:
+        return {"valid": False, "reason": "invalid gripper action"}
+
+    return {
+        "valid": True,
+        "left_arm": left_clipped,
+        "right_arm": right_clipped,
+        "left_gripper": lg,
+        "right_gripper": rg,
     }
 
 def execute_single_task(
@@ -687,15 +883,14 @@ def execute_single_task(
     global freeze_left_image, freeze_right_image
 
     task_complate = False
-    action_finished = False
     FINISH_HOLD_TIME = 0.5
     finish_start_time = None
     left_target_pose = np.array([0.60, 0.60, 1.21])
     current_request_id = 0
     target_location = interface.target_location or ""
-    interface.vla_status["status"] = RUNNING
     async_worker = AsyncRTCInferenceWorker(model, wait_timeout=ASYNC_WAIT_TIMEOUT)
     try:
+        interface.vla_status["status"] = RUNNING
         if "pick" not in task_description and "place" not in task_description:
             robot_controller.h10w_system.enableController(True)
             robot_controller.control_torso(torso=0.54)
@@ -739,6 +934,7 @@ def execute_single_task(
             task_description = infer_ret["new_instruction"]
             interface.latest_instruction = task_description
 
+        reset_per_task_execution_state()
         allow_left_release = "left" in task_description if "place" in task_description else allow_left_release
         allow_right_release = "right" in task_description if "place" in task_description else allow_right_release
         if "place" in task_description and ("left" not in task_description and "right" not in task_description):
@@ -753,10 +949,9 @@ def execute_single_task(
 
         freeze_left_image = "right" in task_description
         freeze_right_image = "left" in task_description
-        left_action_buffer.clear()
-        right_action_buffer.clear()
         step_counter = 0
         task_start_time = time.time()
+        task_epoch = async_worker.start_new_task()
 
         robot_controller.h10w_system.enableController(True)
         robot_controller.h10w_motion.enableRealtimeCmd(True)
@@ -768,10 +963,14 @@ def execute_single_task(
                 time.sleep(0.001)
         current_item_snapshot = prepared["current_item_snapshot"]
         current_request_id += 1
-        async_worker.request(prepared["example"], current_request_id)
-        first_req, current_actions = async_worker.get_blocking()
+        async_worker.request(prepared["example"], current_request_id, task_epoch=task_epoch)
+        first_req, current_actions = async_worker.get_blocking_for_request(current_request_id, task_epoch=task_epoch)
         if first_req != current_request_id:
             raise RuntimeError("initial async request_id mismatch")
+        if "delta" not in args.pretrained_path:
+            logger.warning(
+                "[RTC] policy appears non-delta action mode; inter-chunk consistency may be weaker at boundaries."
+            )
 
         logger.info(
             f"[RTC CONFIG] CONTROL_DT={CONTROL_DT}, RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
@@ -789,10 +988,19 @@ def execute_single_task(
             switched = False
             pending_request_id = None
             next_chunk_item_snapshot = current_item_snapshot
+            last_unexecuted_tail = actions[-1:, ...]
+            rtc_frozen = async_worker.get_recommended_frozen(
+                control_dt=CONTROL_DT,
+                action_horizon=actions.shape[0],
+                default_frozen=RTC_FROZEN,
+            )
+            if step_counter % 100 == 0:
+                logger.info(f"[RTC DIAG] using frozen={rtc_frozen}, overlap={RTC_OVERLAP}, horizon={actions.shape[0]}")
 
             for i in range(exec_steps):
                 start = time.time()
                 step_counter += 1
+                last_unexecuted_tail = actions[i + 1:]
 
                 if time.time() - task_start_time > TASK_TIMEOUT:
                     interface.vla_status["status"] = TIMEOUT
@@ -811,7 +1019,7 @@ def execute_single_task(
                         current_request_id += 1
                         pending_request_id = current_request_id
                         next_chunk_item_snapshot = next_prepared["current_item_snapshot"]
-                        async_worker.request(next_prepared["example"], pending_request_id)
+                        async_worker.request(next_prepared["example"], pending_request_id, task_epoch=task_epoch)
                         async_requested = True
 
                 act = actions[i]
@@ -833,6 +1041,20 @@ def execute_single_task(
                 stable_right = smooth_gripper(right_action_buffer, right_grip_raw)
                 last_left_gripper = resolve_gripper(stable_left, last_left_gripper, left_hand_holding, allow_left_release)
                 last_right_gripper = resolve_gripper(stable_right, last_right_gripper, right_hand_holding, allow_right_release)
+                safe_action = sanitize_action(
+                    left_arm=left_arm,
+                    right_arm=right_arm,
+                    left_gripper=last_left_gripper,
+                    right_gripper=last_right_gripper,
+                    target_location=target_location,
+                )
+                if not safe_action["valid"]:
+                    finish_task_with_failure(interface, f"Unsafe action rejected: {safe_action['reason']}", error_code=-10)
+                    return False, FAILED, safe_action["reason"]
+                left_arm = safe_action["left_arm"]
+                right_arm = safe_action["right_arm"]
+                last_left_gripper = safe_action["left_gripper"]
+                last_right_gripper = safe_action["right_gripper"]
 
                 robot_controller.control_joints(
                     left_arm=left_arm.tolist(),
@@ -844,17 +1066,21 @@ def execute_single_task(
 
                 right_target_pose = left_target_pose.copy()
                 right_target_pose[1] *= -1
-                dl = np.linalg.norm(np.array(state["leftPose"][:3]) - left_target_pose[:3])
-                dr = np.linalg.norm(np.array(state["rightPose"][:3]) - right_target_pose[:3])
-                both_close = (dl < 0.1 and dr < 0.1)
-                if both_close and step_counter > 300:
-                    if finish_start_time is None:
-                        finish_start_time = time.time()
-                    elif time.time() - finish_start_time >= FINISH_HOLD_TIME:
-                        interface.vla_status["status"] = SUCCEEDED
-                        task_complate = True
-                        action_finished = True
-                        break
+                completed, finish_start_time = check_task_completion(
+                    use_left=use_left,
+                    use_right=use_right,
+                    left_pose=state["leftPose"],
+                    right_pose=state["rightPose"],
+                    left_target_pose=left_target_pose,
+                    right_target_pose=right_target_pose,
+                    step_counter=step_counter,
+                    finish_start_time=finish_start_time,
+                    finish_hold_time=FINISH_HOLD_TIME,
+                )
+                if completed:
+                    interface.vla_status["status"] = SUCCEEDED
+                    task_complate = True
+                    break
 
                 if not left_hand_holding:
                     if last_left_gripper == 1:
@@ -896,15 +1122,15 @@ def execute_single_task(
                 interface.vla_status["right_state"] = 1 if right_hand_holding else 0
                 interface.vla_status["left_item"] = left_item_name
                 interface.vla_status["right_item"] = right_item_name
-                interface.vla_status["status"] = RUNNING
+                set_running_if_not_terminal(interface)
 
                 if async_requested and i >= rtc_swap_idx and pending_request_id is not None:
-                    got = async_worker.get_latest_nowait()
+                    got = async_worker.get_latest_matching_request(pending_request_id, task_epoch=task_epoch)
                     if got is not None:
                         req_id, next_actions = got
                         if req_id == pending_request_id:
                             prev_remaining = actions[i + 1:]
-                            current_actions = fuse_action_chunks(prev_remaining, next_actions, overlap=RTC_OVERLAP, frozen=RTC_FROZEN)
+                            current_actions = fuse_action_chunks(prev_remaining, next_actions, overlap=RTC_OVERLAP, frozen=rtc_frozen)
                             current_item_snapshot = next_chunk_item_snapshot
                             switched = True
                             break
@@ -916,17 +1142,22 @@ def execute_single_task(
                 continue
             if async_requested and pending_request_id is not None:
                 try:
-                    req_id, next_actions = async_worker.get_blocking()
+                    req_id, next_actions = async_worker.get_blocking_for_request(
+                        pending_request_id,
+                        task_epoch=task_epoch,
+                        timeout=ASYNC_WAIT_TIMEOUT,
+                    )
+                    prev_remaining = last_unexecuted_tail if len(last_unexecuted_tail) > 0 else actions[-1:, ...]
                     if req_id == pending_request_id:
-                        current_actions = fuse_action_chunks(actions[-1:, ...], next_actions, overlap=RTC_OVERLAP, frozen=1)
+                        current_actions = fuse_action_chunks(prev_remaining, next_actions, overlap=RTC_OVERLAP, frozen=rtc_frozen)
                         current_item_snapshot = next_chunk_item_snapshot
                     else:
-                        current_actions = actions[-1:, ...]
+                        current_actions = prev_remaining
                 except Exception as e:
-                    logger.warning(f"[RTC] async next chunk timeout, fallback hold-last-action: {e}")
-                    current_actions = actions[-1:, ...]
+                    logger.warning(f"[RTC] async next chunk timeout, fallback remaining/hold action: {e}")
+                    current_actions = last_unexecuted_tail if len(last_unexecuted_tail) > 0 else actions[-1:, ...]
             else:
-                current_actions = actions[-1:, ...]
+                current_actions = last_unexecuted_tail if len(last_unexecuted_tail) > 0 else actions[-1:, ...]
 
         if interface.vla_status.get("status") == SUCCEEDED:
             return True, SUCCEEDED, "Task finished"
