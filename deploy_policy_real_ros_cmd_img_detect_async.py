@@ -6,6 +6,7 @@ sys.stdout.flush()
 import time
 import threading
 import logging
+import queue
 import numpy as np
 import rclpy
 import tyro
@@ -65,6 +66,9 @@ CONTROL_DT = 0.01
 SMOOTH_WINDOW = 10
 GRASP_CONFIRM_STEPS = 500
 TASK_TIMEOUT = 40.0  # 
+RTC_OVERLAP = 8
+RTC_FROZEN = 4
+ASYNC_WAIT_TIMEOUT = 2.0
 
 # ===============================
 # gripper smoothing buffer
@@ -119,6 +123,69 @@ def resolve_gripper(stable, last, holding, allow_release):
     if stable is not None:
         return stable
     return last
+
+
+class AsyncRTCInferenceWorker:
+    """
+    异步推理 + RTC chunk 切换辅助器。
+    """
+    def __init__(self, model, wait_timeout: float = ASYNC_WAIT_TIMEOUT):
+        self.model = model
+        self.wait_timeout = wait_timeout
+        self._request_q = queue.Queue(maxsize=1)
+        self._result_q = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                example = self._request_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if example is None:
+                return
+
+            try:
+                response = self.model.step(example)
+                actions = response["raw_actions"]
+                while not self._result_q.empty():
+                    try:
+                        self._result_q.get_nowait()
+                    except queue.Empty:
+                        break
+                self._result_q.put(actions)
+            except Exception as e:
+                logger.exception(f"[ASYNC INFER] inference failed: {e}")
+
+    def request(self, example):
+        while not self._request_q.empty():
+            try:
+                self._request_q.get_nowait()
+            except queue.Empty:
+                break
+        self._request_q.put(example)
+
+    def get_blocking(self):
+        return self._result_q.get(timeout=self.wait_timeout)
+
+    def get_latest_nowait(self):
+        latest = None
+        while not self._result_q.empty():
+            latest = self._result_q.get_nowait()
+        return latest
+
+    def stop(self):
+        self._stop_event.set()
+        while not self._request_q.empty():
+            try:
+                self._request_q.get_nowait()
+            except queue.Empty:
+                break
+        self._request_q.put(None)
+        self._thread.join(timeout=0.5)
 
 frozen_left_rgb = cv2.imread("/home/diana/intern-vla_test/starVLA/debug_images/left.png")
 frozen_right_rgb = cv2.imread("/home/diana/intern-vla_test/starVLA/debug_images/right.png")
@@ -467,6 +534,53 @@ def choose_available_hand(detected_hand: str):
         "reason": "unexpected_hand_arbitration_state"
     }
 
+
+def prepare_policy_example(interface, robot_controller, task_description: str):
+    obs = interface.get_observations()
+    if obs is None:
+        return None
+
+    head_img = obs["head_rgb"]["data"]
+    left_img = obs["left_rgb"]["data"]
+    right_img = obs["right_rgb"]["data"]
+
+    if freeze_left_image:
+        left_img = frozen_left_rgb
+    if freeze_right_image:
+        right_img = frozen_right_rgb
+
+    images = [head_img, left_img, right_img]
+
+    robot_status = robot_controller.get_status()
+    if robot_status is None:
+        return None
+
+    left_arm_joints = robot_status['leftjoint']
+    if "white-desk" in interface.target_location:
+        left_arm_joints[2] += 0.1
+        left_arm_joints[3] += 0.02
+    right_arm_joints = robot_status['rightjoint']
+    left_gripper_state = robot_status['left_gripper']
+    right_gripper_state = robot_status['right_gripper']
+
+    state = np.array(left_arm_joints + left_gripper_state + right_arm_joints + right_gripper_state)
+    state_tensor = torch.tensor(state, dtype=torch.float32)
+    state = normalizer.forward(state_tensor)
+    state = state.numpy().tolist()
+
+    example = {
+        "image": images,
+        "lang": task_description,
+        "state": state,
+    }
+
+    return {
+        "example": example,
+        "left_arm_joints": left_arm_joints,
+        "right_arm_joints": right_arm_joints,
+        "current_item": interface.current_item,
+    }
+
 def main(args: Args):
     global left_hand_holding, right_hand_holding
     global allow_left_release, allow_right_release
@@ -697,6 +811,21 @@ def main(args: Args):
                 freeze_left_image = True 
             
             task_start_time = time.time()
+            async_worker = AsyncRTCInferenceWorker(model)
+            prepared = None
+            while prepared is None:
+                prepared = prepare_policy_example(interface, robot_controller, task_description)
+                if prepared is None:
+                    time.sleep(0.001)
+            async_worker.request(prepared["example"])
+
+            try:
+                current_actions = async_worker.get_blocking()
+            except Exception:
+                async_worker.stop()
+                finish_task_with_failure(interface, msg="初始推理失败", error_code=-8)
+                continue
+
             while not task_complate:
                 # ==========================
                 # 任务超时判断
@@ -752,56 +881,6 @@ def main(args: Args):
                     action_finished = True
                     break
                     
-                obs = interface.get_observations()
-                if obs is None:
-                    continue
-
-                # images = [
-                #     obs["head_rgb"]["data"],
-                #     obs["left_rgb"]["data"],
-                #     obs["right_rgb"]["data"],
-                # ]
-
-                head_img = obs["head_rgb"]["data"]
-                left_img = obs["left_rgb"]["data"]
-                right_img = obs["right_rgb"]["data"]
-
-                # ===============================
-                # 冻结逻辑
-                # ===============================
-                if freeze_left_image:
-                    left_img = frozen_left_rgb
-
-                if freeze_right_image:
-                    right_img = frozen_right_rgb
-
-                images = [head_img, left_img, right_img]
-
-                robot_status = robot_controller.get_status()
-                if robot_status is None:
-                    time.sleep(0.01)
-                    continue
-                left_arm_joints = robot_status['leftjoint'] 
-                if "white-desk" in interface.target_location:
-                    left_arm_joints[2] += 0.1
-                    left_arm_joints[3] += 0.02
-                right_arm_joints = robot_status['rightjoint']
-                left_gripper_state = robot_status['left_gripper']
-                right_gripper_state = robot_status['right_gripper']
-                
-                state = np.array(left_arm_joints + left_gripper_state + right_arm_joints + right_gripper_state)
-                state_tensor = torch.tensor(state, dtype=torch.float32)
-                state = normalizer.forward(state_tensor)
-                state = state.numpy().tolist()
-
-                example = {
-                    "image": images,
-                    "lang": task_description,
-                    "state": state,
-                }
-
-                current_item = interface.current_item  
-                
                 robot_status = robot_controller.get_status()
                 if robot_status is None:
                     time.sleep(0.001)
@@ -850,16 +929,32 @@ def main(args: Args):
                         
                         break
 
-                response = model.step(example)
-                actions = response["raw_actions"]
+                actions = current_actions
 
                 interface.vla_status["status"] = 2
 
                 exec_steps = actions.shape[0]- 0
+                rtc_trigger_idx = max(0, exec_steps - RTC_OVERLAP)
+                rtc_swap_idx = min(exec_steps - 1, rtc_trigger_idx + RTC_FROZEN)
+                async_requested = False
+                switched_to_next_chunk = False
+
                 for i in range(exec_steps):
                     act = actions[i]
                     start = time.time()
                     step_counter += 1
+
+                    if (not async_requested) and i >= rtc_trigger_idx:
+                        next_prepared = prepare_policy_example(interface, robot_controller, task_description)
+                        if next_prepared is not None:
+                            async_worker.request(next_prepared["example"])
+                            async_requested = True
+
+                    current_item = interface.current_item
+                    prep_for_delta = prepare_policy_example(interface, robot_controller, task_description)
+                    if prep_for_delta is not None:
+                        left_arm_joints = prep_for_delta["left_arm_joints"]
+                        right_arm_joints = prep_for_delta["right_arm_joints"]
                     
                     # delta OR absolute
                     if "delta" in Args.pretrained_path:
@@ -970,6 +1065,33 @@ def main(args: Args):
                     interface.vla_status["right_state"] = 1 if right_hand_holding else 0
                     interface.vla_status["left_item"] = left_item_name
                     interface.vla_status["right_item"] = right_item_name
+
+                    if async_requested and i >= rtc_swap_idx:
+                        next_actions = async_worker.get_latest_nowait()
+                        if next_actions is not None:
+                            current_actions = next_actions
+                            switched_to_next_chunk = True
+                            break
+
+                if not switched_to_next_chunk:
+                    if async_requested:
+                        try:
+                            current_actions = async_worker.get_blocking()
+                        except Exception as e:
+                            logger.warning(f"[RTC] async next chunk not ready in time: {e}")
+                            # 兜底：继续使用当前 chunk 最后一步，避免 stop-and-go
+                            current_actions = actions[-1:, ...]
+                    else:
+                        # 没触发重叠请求（chunk 太短），补一次同步请求
+                        next_prepared = prepare_policy_example(interface, robot_controller, task_description)
+                        if next_prepared is not None:
+                            async_worker.request(next_prepared["example"])
+                            try:
+                                current_actions = async_worker.get_blocking()
+                            except Exception:
+                                current_actions = actions[-1:, ...]
+            
+            async_worker.stop()
             
             robot_controller.init_left()
             robot_controller.init_right()
