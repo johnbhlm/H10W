@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SerialPorts>
+    <SerialPort name="/dev/ttyUSB0">
+        <minStroke>0.000000</minStroke>
+        <maxStroke>80.000000</maxStroke>
+        <offset>0.000000</offset>
+        <maxSpeed>110.0</maxSpeed>
+        <maxAcc>1100.0</maxAcc>
+        <maxForce>50.000000</maxForce>
+        <gripperName></gripperName>
+    </SerialPort>
+    <SerialPort name="/dev/ttyUSB1">
+        <minStroke>0.000000</minStroke>
+        <maxStroke>80.000000</maxStroke>
+        <offset>0.000000</offset>
+        <maxSpeed>110.0</maxSpeed>
+        <maxAcc>1100.0</maxAcc>
+        <maxForce>50.000000</maxForce>
+        <gripperName></gripperName>
+    </SerialPort>
+</SerialPorts>
