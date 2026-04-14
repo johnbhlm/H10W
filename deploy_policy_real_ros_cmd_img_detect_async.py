@@ -956,6 +956,7 @@ def execute_single_task(
     target_location = interface.target_location or ""
     async_worker = AsyncRTCInferenceWorker(model, wait_timeout=ASYNC_WAIT_TIMEOUT)
     stop_submitting_requests = False
+    task_exiting = False
     try:
         interface.vla_status["status"] = RUNNING
         if "pick" not in task_description and "place" not in task_description:
@@ -1026,6 +1027,8 @@ def execute_single_task(
             "empty_or_invalid_chunk_count": 0,
             "next_chunk_wait_ema": None,
         }
+        state_missing_count = 0
+        MAX_STATE_MISS = 20
 
         robot_controller.h10w_system.enableController(True)
         robot_controller.h10w_motion.enableRealtimeCmd(True)
@@ -1037,11 +1040,15 @@ def execute_single_task(
             if prepared is None:
                 time.sleep(0.001)
         if prepared is None:
+            task_exiting = True
             finish_task_with_failure(interface, "Initial observation unavailable", error_code=-11)
             return False, FAILED, "Initial observation unavailable"
         current_item_snapshot = prepared["current_item_snapshot"]
         current_request_id += 1
+        if task_exiting:
+            return False, FAILED, "Task exiting"
         if not async_worker.request(prepared["example"], current_request_id, task_epoch=task_epoch):
+            task_exiting = True
             finish_task_with_failure(interface, "Initial inference request rejected", error_code=-12)
             return False, FAILED, "Initial inference request rejected"
         try:
@@ -1050,10 +1057,12 @@ def execute_single_task(
                 raise RuntimeError("initial async request_id mismatch")
         except Exception as e:
             logger.error(f"[RTC] initial blocking inference failed: {e}")
+            task_exiting = True
             finish_task_with_failure(interface, "Initial inference failed/timeout", error_code=-13)
             return False, FAILED, "Initial inference failed/timeout"
         if current_actions is None or len(current_actions) == 0:
             rtc_diag["empty_or_invalid_chunk_count"] += 1
+            task_exiting = True
             finish_task_with_failure(interface, "Empty action chunk", error_code=-14)
             return False, FAILED, "Empty action chunk"
 
@@ -1077,6 +1086,7 @@ def execute_single_task(
             actions = current_actions
             if not is_valid_chunk(actions):
                 rtc_diag["empty_or_invalid_chunk_count"] += 1
+                task_exiting = True
                 finish_task_with_failure(interface, "Empty action chunk", error_code=-14)
                 return False, FAILED, "Empty action chunk"
             exec_steps = actions.shape[0]
@@ -1111,14 +1121,36 @@ def execute_single_task(
 
                 if time.time() - task_start_time > TASK_TIMEOUT:
                     interface.vla_status["status"] = TIMEOUT
+                    task_exiting = True
                     return False, TIMEOUT, "Task timeout"
                 if interface.vla_status.get("status") == FAILED:
+                    task_exiting = True
                     return False, FAILED, "Task failed by status flag"
 
                 state = get_current_control_state(robot_controller, target_location)
-                if state is None or state["leftPose"] is None or state["rightPose"] is None:
-                    finish_task_with_failure(interface, "Robot pose unavailable", error_code=-9)
-                    return False, FAILED, "Robot pose unavailable"
+                if state is None:
+                    state_missing_count += 1
+                    logger.warning(f"[RTC] control state unavailable ({state_missing_count}/{MAX_STATE_MISS})")
+                    if state_missing_count >= MAX_STATE_MISS:
+                        task_exiting = True
+                        finish_task_with_failure(interface, "Robot control state unavailable repeatedly", error_code=-9)
+                        return False, FAILED, "Robot control state unavailable repeatedly"
+                    time.sleep(0.005)
+                    continue
+                state_missing_count = 0
+
+                left_pose = state.get("leftPose")
+                right_pose = state.get("rightPose")
+                left_arm_state = state.get("left_arm_joints")
+                right_arm_state = state.get("right_arm_joints")
+                if left_pose is None or right_pose is None or left_arm_state is None or right_arm_state is None:
+                    logger.warning(
+                        "[RTC] control state fields missing: "
+                        f"leftPose={left_pose is not None}, rightPose={right_pose is not None}, "
+                        f"left_arm_joints={left_arm_state is not None}, right_arm_joints={right_arm_state is not None}"
+                    )
+                    time.sleep(0.005)
+                    continue
 
                 if (not async_requested) and i >= rtc_trigger_idx:
                     next_prepared = prepare_policy_example(interface, robot_controller, task_description)
@@ -1126,15 +1158,15 @@ def execute_single_task(
                         current_request_id += 1
                         pending_request_id = current_request_id
                         next_chunk_item_snapshot = next_prepared["current_item_snapshot"]
-                        if async_worker.request(next_prepared["example"], pending_request_id, task_epoch=task_epoch):
+                        if (not task_exiting) and async_worker.request(next_prepared["example"], pending_request_id, task_epoch=task_epoch):
                             async_requested = True
                             rtc_diag["overlap_requests_submitted"] += 1
                     else:
                         logger.debug("[RTC] overlap preparation unavailable this cycle; skip overlap request")
 
                 act = actions[i]
-                left_arm_joints = np.array(state["left_arm_joints"], dtype=np.float32)
-                right_arm_joints = np.array(state["right_arm_joints"], dtype=np.float32)
+                left_arm_joints = np.array(left_arm_state, dtype=np.float32)
+                right_arm_joints = np.array(right_arm_state, dtype=np.float32)
                 if "delta" in args.pretrained_path:
                     left_arm = left_arm_joints + np.array(act[0:7])
                     right_arm = right_arm_joints + np.array(act[8:15])
@@ -1159,6 +1191,7 @@ def execute_single_task(
                     target_location=target_location,
                 )
                 if not safe_action["valid"]:
+                    task_exiting = True
                     finish_task_with_failure(interface, f"Unsafe action rejected: {safe_action['reason']}", error_code=-10)
                     return False, FAILED, safe_action["reason"]
                 left_arm = safe_action["left_arm"]
@@ -1179,8 +1212,8 @@ def execute_single_task(
                 completed, finish_start_time = check_task_completion(
                     use_left=use_left,
                     use_right=use_right,
-                    left_pose=state["leftPose"],
-                    right_pose=state["rightPose"],
+                    left_pose=left_pose,
+                    right_pose=right_pose,
                     left_target_pose=left_target_pose,
                     right_target_pose=right_target_pose,
                     step_counter=step_counter,
@@ -1306,11 +1339,15 @@ def execute_single_task(
             f"infer_latency_ema={async_worker.get_latency_ema()}, next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
         )
         if interface.vla_status.get("status") == SUCCEEDED:
+            task_exiting = True
             return True, SUCCEEDED, "Task finished"
         if interface.vla_status.get("status") == TIMEOUT:
+            task_exiting = True
             return False, TIMEOUT, "Task timeout"
+        task_exiting = True
         return False, FAILED, "Task failed"
     finally:
+        task_exiting = True
         if not stop_submitting_requests:
             logger.debug("[RTC] task exiting; no further async requests will be submitted")
         async_worker.stop()
@@ -1368,7 +1405,11 @@ def main(args: Args):
             detector_client=detector_client,
             task_description=task_description,
         )
-        if wait_for_goal_handle(interface):
+        should_write_result = True
+        with interface._lock:
+            if interface._done_event.is_set() and interface._result_msg is not None:
+                should_write_result = False
+        if should_write_result and wait_for_goal_handle(interface):
             result = ActionVLA.Result()
             result.success = bool(final_state == SUCCEEDED and success)
             result.final_state = final_state
