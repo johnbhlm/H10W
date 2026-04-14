@@ -1059,13 +1059,18 @@ def execute_single_task(
             )
             logger.warning("[RTC] RTC enabled in non-delta mode; expect weaker inter-chunk consistency")
 
+        detected_horizon = current_actions.shape[0]
         logger.info(
             f"[RTC CONFIG] CONTROL_DT={CONTROL_DT}, RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
             f"RTC_REQUEST_EARLY_RATIO={RTC_REQUEST_EARLY_RATIO}, "
             f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}, ACTION_HORIZON={current_actions.shape[0]}"
         )
-        if current_actions.shape[0] < 32:
-            logger.warning("RTC is enabled but action chunk length < 32; smooth fusion quality may be limited.")
+        if detected_horizon != 32:
+            logger.warning(
+                f"Expected action horizon 32, but got {detected_horizon}. RTC defaults may be suboptimal."
+            )
+        else:
+            logger.info("RTC tuned for action horizon 32.")
 
         while not task_complete:
             actions = current_actions
