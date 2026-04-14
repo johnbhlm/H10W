@@ -70,6 +70,7 @@ CONTROL_DT = 0.01
 # CONTROL_DT = 0.008
 SMOOTH_WINDOW = 10
 GRASP_CONFIRM_STEPS = 500
+EARLY_HOLD_STEPS = 50
 TASK_TIMEOUT = 40.0  # 
 RTC_OVERLAP = 8
 RTC_FROZEN = 4
@@ -1235,8 +1236,9 @@ def execute_single_task(
                         left_grasp_counter += 1
                         if left_grasp_counter >= 50 and left_item_name == "":
                             left_item_name = current_item_snapshot
-                        if left_grasp_counter >= GRASP_CONFIRM_STEPS:
+                        if "pick" in task_description.lower() and left_grasp_counter >= EARLY_HOLD_STEPS:
                             left_hand_holding = True
+                        if left_grasp_counter >= GRASP_CONFIRM_STEPS:
                             left_grasp_counter = GRASP_CONFIRM_STEPS
                     else:
                         left_grasp_counter = 0
@@ -1253,8 +1255,9 @@ def execute_single_task(
                         right_grasp_counter += 1
                         if right_grasp_counter >= 50 and right_item_name == "":
                             right_item_name = current_item_snapshot
-                        if right_grasp_counter >= GRASP_CONFIRM_STEPS:
+                        if "pick" in task_description.lower() and right_grasp_counter >= EARLY_HOLD_STEPS:
                             right_hand_holding = True
+                        if right_grasp_counter >= GRASP_CONFIRM_STEPS:
                             right_grasp_counter = GRASP_CONFIRM_STEPS
                     else:
                         right_grasp_counter = 0
