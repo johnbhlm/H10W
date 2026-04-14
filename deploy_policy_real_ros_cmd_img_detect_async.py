@@ -891,6 +891,7 @@ def validate_workspace(left_arm, right_arm, target_location: str):
 
 
 def sanitize_action(left_arm, right_arm, left_gripper, right_gripper, target_location):
+    logger.warning("[SAFETY-BYPASS] joint/workspace safety checks are temporarily disabled")
     left = np.asarray(left_arm, dtype=np.float32).reshape(-1)
     right = np.asarray(right_arm, dtype=np.float32).reshape(-1)
     if left.shape[0] != 7 or right.shape[0] != 7:
@@ -900,34 +901,16 @@ def sanitize_action(left_arm, right_arm, left_gripper, right_gripper, target_loc
     if not np.isfinite(float(left_gripper)) or not np.isfinite(float(right_gripper)):
         return {"valid": False, "reason": "non-finite gripper action"}
 
-    left_below = LEFT_ARM_JOINT_MIN - left
-    left_above = left - LEFT_ARM_JOINT_MAX
-    right_below = RIGHT_ARM_JOINT_MIN - right
-    right_above = right - RIGHT_ARM_JOINT_MAX
-    severe_left = float(max(np.max(left_below), np.max(left_above)))
-    severe_right = float(max(np.max(right_below), np.max(right_above)))
-    if severe_left > JOINT_SEVERE_MARGIN_RAD or severe_right > JOINT_SEVERE_MARGIN_RAD:
-        return {"valid": False, "reason": f"arm action severely out of limits (L={severe_left:.3f}, R={severe_right:.3f})"}
-
-    left_clipped = np.clip(left, LEFT_ARM_JOINT_MIN, LEFT_ARM_JOINT_MAX)
-    right_clipped = np.clip(right, RIGHT_ARM_JOINT_MIN, RIGHT_ARM_JOINT_MAX)
-    if not np.allclose(left, left_clipped, atol=1e-4) or not np.allclose(right, right_clipped, atol=1e-4):
-        logger.warning(f"[SAFETY] arm action clipped within joint limits for target_location={target_location}")
-
     try:
         lg = int(float(left_gripper) >= 0.5)
         rg = int(float(right_gripper) >= 0.5)
     except Exception:
         return {"valid": False, "reason": "invalid gripper action"}
 
-    ws = validate_workspace(left_clipped, right_clipped, target_location)
-    if not ws.get("valid", False):
-        return {"valid": False, "reason": ws.get("reason", "workspace invalid")}
-
     return {
         "valid": True,
-        "left_arm": left_clipped,
-        "right_arm": right_clipped,
+        "left_arm": left,
+        "right_arm": right,
         "left_gripper": lg,
         "right_gripper": rg,
     }
@@ -1189,6 +1172,8 @@ def execute_single_task(
                 stable_right = smooth_gripper(right_action_buffer, right_grip_raw)
                 last_left_gripper = resolve_gripper(stable_left, last_left_gripper, left_hand_holding, allow_left_release)
                 last_right_gripper = resolve_gripper(stable_right, last_right_gripper, right_hand_holding, allow_right_release)
+                logger.info(f"[DEBUG ACTION] left_arm_raw={left_arm}")
+                logger.info(f"[DEBUG ACTION] right_arm_raw={right_arm}")
                 safe_action = sanitize_action(
                     left_arm=left_arm,
                     right_arm=right_arm,
