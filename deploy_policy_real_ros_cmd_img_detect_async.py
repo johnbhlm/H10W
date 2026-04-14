@@ -72,9 +72,10 @@ SMOOTH_WINDOW = 10
 GRASP_CONFIRM_STEPS = 500
 EARLY_HOLD_STEPS = 50
 TASK_TIMEOUT = 40.0  # 
-RTC_OVERLAP = 8
-RTC_FROZEN = 4
-RTC_REQUEST_EARLY_RATIO = 0.25
+RTC_OVERLAP = 16
+RTC_FROZEN = 8
+RTC_REQUEST_LEAD_STEPS = 12
+RTC_SWAP_GUARD_STEPS = 8
 ASYNC_WAIT_TIMEOUT = 2.0
 INITIAL_PREP_TIMEOUT = 3.0
 MIN_FINISH_STEPS = 300
@@ -1061,9 +1062,11 @@ def execute_single_task(
 
         detected_horizon = current_actions.shape[0]
         logger.info(
-            f"[RTC CONFIG] CONTROL_DT={CONTROL_DT}, RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
-            f"RTC_REQUEST_EARLY_RATIO={RTC_REQUEST_EARLY_RATIO}, "
-            f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}, ACTION_HORIZON={current_actions.shape[0]}"
+            f"[RTC CONFIG] CONTROL_DT={CONTROL_DT}, ACTION_HORIZON={current_actions.shape[0]}, "
+            f"RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
+            f"RTC_REQUEST_LEAD_STEPS={RTC_REQUEST_LEAD_STEPS}, RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, "
+            f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}, latency_ema={async_worker.get_latency_ema()}, "
+            f"next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
         )
         if detected_horizon != 32:
             logger.warning(
@@ -1092,16 +1095,24 @@ def execute_single_task(
             )
             rtc_overlap_effective = max(RTC_OVERLAP, rtc_frozen + 4)
             rtc_overlap_effective = max(1, min(rtc_overlap_effective, max(1, exec_steps - 1)))
-            early_request_idx = max(1, int(exec_steps * RTC_REQUEST_EARLY_RATIO))
-            rtc_trigger_idx = min(max(0, early_request_idx), max(0, exec_steps - 1))
-            rtc_swap_idx = min(exec_steps - 1, rtc_trigger_idx + rtc_frozen)
+
+            swap_guard_steps = max(RTC_SWAP_GUARD_STEPS, rtc_frozen)
+            swap_guard_steps = min(swap_guard_steps, max(1, exec_steps - 1))
+
+            request_lead_steps = max(RTC_REQUEST_LEAD_STEPS, rtc_frozen + 2)
+            request_lead_steps = min(request_lead_steps, max(1, exec_steps - 1))
+
+            rtc_swap_idx = max(0, exec_steps - swap_guard_steps)
+            rtc_trigger_idx = max(0, rtc_swap_idx - request_lead_steps)
             if step_counter % 100 == 0:
                 logger.info(
-                    f"[RTC DIAG] default_frozen={RTC_FROZEN}, estimated_frozen={rtc_frozen}, "
-                    f"effective_overlap={rtc_overlap_effective}, horizon={actions.shape[0]}, "
-                    f"trigger_idx={rtc_trigger_idx}, swap_idx={rtc_swap_idx}, exec_steps={exec_steps}, "
-                    f"submitted={rtc_diag['overlap_requests_submitted']}, switched={rtc_diag['successful_rtc_switches']}, "
-                    f"fallbacks={rtc_diag['blocking_fallbacks']}, stale_dropped={async_worker.get_stale_inflight_dropped()}, "
+                    f"[RTC DIAG] ACTION_HORIZON={actions.shape[0]}, default_frozen={RTC_FROZEN}, rtc_frozen={rtc_frozen}, "
+                    f"rtc_overlap_effective={rtc_overlap_effective}, trigger_idx={rtc_trigger_idx}, swap_idx={rtc_swap_idx}, "
+                    f"request_lead={request_lead_steps}, swap_guard={swap_guard_steps}, "
+                    f"RTC_REQUEST_LEAD_STEPS={RTC_REQUEST_LEAD_STEPS}, RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, "
+                    f"exec_steps={exec_steps}, submitted={rtc_diag['overlap_requests_submitted']}, "
+                    f"switched={rtc_diag['successful_rtc_switches']}, fallbacks={rtc_diag['blocking_fallbacks']}, "
+                    f"stale_dropped={async_worker.get_stale_inflight_dropped()}, "
                     f"empty_invalid={rtc_diag['empty_or_invalid_chunk_count']}, latency_ema={async_worker.get_latency_ema()}, "
                     f"next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
                 )
@@ -1159,8 +1170,8 @@ def execute_single_task(
                             async_requested = True
                             rtc_diag["overlap_requests_submitted"] += 1
                             logger.info(
-                                f"[RTC] overlap request submitted request_id={pending_request_id}, "
-                                f"step_i={i}, trigger_idx={rtc_trigger_idx}, exec_steps={exec_steps}"
+                                f"[RTC] overlap request submitted step_i={i}, exec_steps={exec_steps}, "
+                                f"trigger_idx={rtc_trigger_idx}, swap_idx={rtc_swap_idx}, request_id={pending_request_id}"
                             )
                     else:
                         logger.debug("[RTC] overlap preparation unavailable this cycle; skip overlap request")
@@ -1397,6 +1408,7 @@ def main(args: Args):
     detector_client = DetectionClient3DSync("ws://10.8.26.11:8000")
     logger.info(
         f"Runtime config: CONTROL_DT={CONTROL_DT}, RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
+        f"RTC_REQUEST_LEAD_STEPS={RTC_REQUEST_LEAD_STEPS}, RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, "
         f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}"
     )
 
