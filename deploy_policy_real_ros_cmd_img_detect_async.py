@@ -948,14 +948,13 @@ def execute_single_task(
     global use_left, use_right
     global freeze_left_image, freeze_right_image
 
-    task_complate = False
+    task_complete = False
     FINISH_HOLD_TIME = 0.5
     finish_start_time = None
     left_target_pose = np.array([0.60, 0.60, 1.21])
     current_request_id = 0
     target_location = interface.target_location or ""
     async_worker = AsyncRTCInferenceWorker(model, wait_timeout=ASYNC_WAIT_TIMEOUT)
-    stop_submitting_requests = False
     task_exiting = False
     try:
         interface.vla_status["status"] = RUNNING
@@ -1082,7 +1081,7 @@ def execute_single_task(
         if current_actions.shape[0] < 32:
             logger.warning("RTC is enabled but action chunk length < 32; smooth fusion quality may be limited.")
 
-        while not task_complate:
+        while not task_complete:
             actions = current_actions
             if not is_valid_chunk(actions):
                 rtc_diag["empty_or_invalid_chunk_count"] += 1
@@ -1144,13 +1143,19 @@ def execute_single_task(
                 left_arm_state = state.get("left_arm_joints")
                 right_arm_state = state.get("right_arm_joints")
                 if left_pose is None or right_pose is None or left_arm_state is None or right_arm_state is None:
+                    state_missing_count += 1
                     logger.warning(
-                        "[RTC] control state fields missing: "
+                        f"[RTC] control state fields missing ({state_missing_count}/{MAX_STATE_MISS}): "
                         f"leftPose={left_pose is not None}, rightPose={right_pose is not None}, "
                         f"left_arm_joints={left_arm_state is not None}, right_arm_joints={right_arm_state is not None}"
                     )
+                    if state_missing_count >= MAX_STATE_MISS:
+                        task_exiting = True
+                        finish_task_with_failure(interface, "Robot control state incomplete repeatedly", error_code=-9)
+                        return False, FAILED, "Robot control state incomplete repeatedly"
                     time.sleep(0.005)
                     continue
+                state_missing_count = 0
 
                 if (not async_requested) and i >= rtc_trigger_idx:
                     next_prepared = prepare_policy_example(interface, robot_controller, task_description)
@@ -1222,7 +1227,7 @@ def execute_single_task(
                 )
                 if completed:
                     interface.vla_status["status"] = SUCCEEDED
-                    task_complate = True
+                    task_complete = True
                     break
 
                 if not left_hand_holding:
@@ -1288,7 +1293,7 @@ def execute_single_task(
                             logger.warning("[RTC] next chunk empty/invalid at swap; keep running current chunk")
                 time.sleep(max(0.0, CONTROL_DT - (time.time() - start)))
 
-            if task_complate:
+            if task_complete:
                 break
             if switched:
                 continue
@@ -1329,7 +1334,6 @@ def execute_single_task(
             else:
                 current_actions = last_unexecuted_tail if len(last_unexecuted_tail) > 0 else actions[-1:, ...]
 
-        stop_submitting_requests = True
         logger.info(
             f"[RTC SUMMARY] submitted={rtc_diag['overlap_requests_submitted']}, "
             f"switched={rtc_diag['successful_rtc_switches']}, "
@@ -1348,8 +1352,6 @@ def execute_single_task(
         return False, FAILED, "Task failed"
     finally:
         task_exiting = True
-        if not stop_submitting_requests:
-            logger.debug("[RTC] task exiting; no further async requests will be submitted")
         async_worker.stop()
         robot_controller.init_left()
         robot_controller.init_right()
@@ -1397,6 +1399,9 @@ def main(args: Args):
         if task_description is None or not interface.new_task_flag:
             time.sleep(0.01)
             continue
+        with interface._lock:
+            interface._done_event.clear()
+            interface._result_msg = None
         success, final_state, result_msg = execute_single_task(
             args=args,
             interface=interface,
@@ -1423,4 +1428,5 @@ def main(args: Args):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     tyro.cli(main)
