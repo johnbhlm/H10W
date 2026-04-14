@@ -72,8 +72,8 @@ SMOOTH_WINDOW = 10
 GRASP_CONFIRM_STEPS = 500
 EARLY_HOLD_STEPS = 50
 TASK_TIMEOUT = 40.0  # 
-RTC_OVERLAP = 8
-RTC_FROZEN = 4
+RTC_OVERLAP = 16
+RTC_FROZEN = 8
 ASYNC_WAIT_TIMEOUT = 2.0
 INITIAL_PREP_TIMEOUT = 3.0
 MIN_FINISH_STEPS = 300
@@ -1058,12 +1058,19 @@ def execute_single_task(
             )
             logger.warning("[RTC] RTC enabled in non-delta mode; expect weaker inter-chunk consistency")
 
+        detected_horizon = current_actions.shape[0]
         logger.info(
             f"[RTC CONFIG] CONTROL_DT={CONTROL_DT}, RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
-            f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}, ACTION_HORIZON={current_actions.shape[0]}"
+            f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}, ACTION_HORIZON={detected_horizon}, "
+            f"default_frozen={RTC_FROZEN}, estimated_frozen=pending, effective_overlap=pending, "
+            f"tuning_target_horizon=32"
         )
-        if current_actions.shape[0] < 32:
-            logger.warning("RTC is enabled but action chunk length < 32; smooth fusion quality may be limited.")
+        if detected_horizon != 32:
+            logger.warning(
+                f"Expected action horizon 32, but got {detected_horizon}. RTC defaults may be suboptimal."
+            )
+        else:
+            logger.info("RTC tuned for action horizon 32.")
 
         while not task_complete:
             actions = current_actions
@@ -1089,8 +1096,9 @@ def execute_single_task(
             rtc_swap_idx = min(exec_steps - 1, rtc_trigger_idx + rtc_frozen)
             if step_counter % 100 == 0:
                 logger.info(
-                    f"[RTC DIAG] default_frozen={RTC_FROZEN}, estimated_frozen={rtc_frozen}, "
-                    f"effective_overlap={rtc_overlap_effective}, horizon={actions.shape[0]}, "
+                    f"[RTC DIAG] ACTION_HORIZON={actions.shape[0]}, default_frozen={RTC_FROZEN}, "
+                    f"estimated_frozen={rtc_frozen}, effective_overlap={rtc_overlap_effective}, "
+                    f"tuning_target_horizon=32, "
                     f"submitted={rtc_diag['overlap_requests_submitted']}, switched={rtc_diag['successful_rtc_switches']}, "
                     f"fallbacks={rtc_diag['blocking_fallbacks']}, stale_dropped={async_worker.get_stale_inflight_dropped()}, "
                     f"empty_invalid={rtc_diag['empty_or_invalid_chunk_count']}, latency_ema={async_worker.get_latency_ema()}, "
