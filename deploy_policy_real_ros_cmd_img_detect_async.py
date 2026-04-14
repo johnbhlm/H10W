@@ -1106,10 +1106,9 @@ def execute_single_task(
                     f"next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
                 )
 
-            for i in range(exec_steps):
+            i = 0
+            while i < exec_steps:
                 start = time.time()
-                step_counter += 1
-                last_unexecuted_tail = actions[i + 1:]
 
                 if time.time() - task_start_time > TASK_TIMEOUT:
                     interface.vla_status["status"] = TIMEOUT
@@ -1210,6 +1209,8 @@ def execute_single_task(
                     right_gripper=last_right_gripper,
                     control_time=CONTROL_DT,
                 )
+                step_counter += 1
+                last_unexecuted_tail = actions[i + 1:]
 
                 right_target_pose = left_target_pose.copy()
                 right_target_pose[1] *= -1
@@ -1293,10 +1294,14 @@ def execute_single_task(
                             rtc_diag["empty_or_invalid_chunk_count"] += 1
                             logger.warning("[RTC] next chunk empty/invalid at swap; keep running current chunk")
                 time.sleep(max(0.0, CONTROL_DT - (time.time() - start)))
+                i += 1
 
             if task_complete:
                 break
             if switched:
+                continue
+            if len(last_unexecuted_tail) > 0:
+                current_actions = last_unexecuted_tail
                 continue
             if async_requested and pending_request_id is not None:
                 try:
