@@ -80,6 +80,11 @@ ASYNC_WAIT_TIMEOUT = 2.0
 INITIAL_PREP_TIMEOUT = 3.0
 MIN_FINISH_STEPS = 300
 
+USE_ASYNC_PREFETCH = True
+USE_RTC_FUSION = True
+ENABLE_HOTPATH_LOGS = False
+ENABLE_RTC_DIAG_LOGS = True
+
 # 安全阈值（TODO: 用真机标定值替换）
 LEFT_ARM_JOINT_MIN = np.array([-2.9, -1.8, -2.9, -3.0, -2.9, -1.9, -2.9], dtype=np.float32)
 LEFT_ARM_JOINT_MAX = np.array([2.9, 1.8, 2.9, 0.2, 2.9, 1.9, 2.9], dtype=np.float32)
@@ -893,7 +898,6 @@ def validate_workspace(left_arm, right_arm, target_location: str):
 
 
 def sanitize_action(left_arm, right_arm, left_gripper, right_gripper, target_location):
-    logger.warning("[SAFETY-BYPASS] joint/workspace safety checks are temporarily disabled")
     left = np.asarray(left_arm, dtype=np.float32).reshape(-1)
     right = np.asarray(right_arm, dtype=np.float32).reshape(-1)
     if left.shape[0] != 7 or right.shape[0] != 7:
@@ -940,8 +944,24 @@ def execute_single_task(
     left_target_pose = np.array([0.60, 0.60, 1.21])
     current_request_id = 0
     target_location = interface.target_location or ""
-    async_worker = AsyncRTCInferenceWorker(model, wait_timeout=ASYNC_WAIT_TIMEOUT)
+    use_async_prefetch = USE_ASYNC_PREFETCH
+    use_rtc_fusion = USE_RTC_FUSION
+    if (not use_async_prefetch) and use_rtc_fusion:
+        logger.warning("RTC requires async prefetch; forcing USE_RTC_FUSION=False")
+        use_rtc_fusion = False
+    async_worker = AsyncRTCInferenceWorker(model, wait_timeout=ASYNC_WAIT_TIMEOUT) if use_async_prefetch else None
     task_exiting = False
+
+    def is_valid_chunk(chunk):
+        return chunk is not None and len(chunk) > 0
+
+    def run_sync_inference(example):
+        t0 = time.time()
+        response = model.step(example)
+        latency = time.time() - t0
+        actions = response["raw_actions"]
+        return actions, latency
+
     try:
         interface.vla_status["status"] = RUNNING
         if "pick" not in task_description and "place" not in task_description:
@@ -988,6 +1008,7 @@ def execute_single_task(
             interface.latest_instruction = task_description
 
         reset_per_task_execution_state()
+        logger.warning("SAFETY-BYPASS enabled for this task")
         allow_left_release = "left" in task_description if "place" in task_description else allow_left_release
         allow_right_release = "right" in task_description if "place" in task_description else allow_right_release
         if "place" in task_description and ("left" not in task_description and "right" not in task_description):
@@ -1004,7 +1025,7 @@ def execute_single_task(
         freeze_right_image = "left" in task_description
         step_counter = 0
         task_start_time = time.time()
-        task_epoch = async_worker.start_new_task()
+        task_epoch = async_worker.start_new_task() if async_worker is not None else 0
         rtc_diag = {
             "overlap_requests_submitted": 0,
             "successful_rtc_switches": 0,
@@ -1029,35 +1050,42 @@ def execute_single_task(
             finish_task_with_failure(interface, "Initial observation unavailable", error_code=-11)
             return False, FAILED, "Initial observation unavailable"
         current_item_snapshot = prepared["current_item_snapshot"]
-        current_request_id += 1
-        if task_exiting:
-            return False, FAILED, "Task exiting"
-        if not async_worker.request(prepared["example"], current_request_id, task_epoch=task_epoch):
-            task_exiting = True
-            finish_task_with_failure(interface, "Initial inference request rejected", error_code=-12)
-            return False, FAILED, "Initial inference request rejected"
-        try:
-            first_req, current_actions = async_worker.get_blocking_for_request(current_request_id, task_epoch=task_epoch)
-            if first_req != current_request_id:
-                raise RuntimeError("initial async request_id mismatch")
-        except Exception as e:
-            logger.error(f"[RTC] initial blocking inference failed: {e}")
-            task_exiting = True
-            finish_task_with_failure(interface, "Initial inference failed/timeout", error_code=-13)
-            return False, FAILED, "Initial inference failed/timeout"
+
+        if use_async_prefetch:
+            current_request_id += 1
+            if task_exiting:
+                return False, FAILED, "Task exiting"
+            if not async_worker.request(prepared["example"], current_request_id, task_epoch=task_epoch):
+                task_exiting = True
+                finish_task_with_failure(interface, "Initial inference request rejected", error_code=-12)
+                return False, FAILED, "Initial inference request rejected"
+            try:
+                first_req, current_actions = async_worker.get_blocking_for_request(current_request_id, task_epoch=task_epoch)
+                if first_req != current_request_id:
+                    raise RuntimeError("initial async request_id mismatch")
+            except Exception as e:
+                logger.error(f"[RTC] initial blocking inference failed: {e}")
+                task_exiting = True
+                finish_task_with_failure(interface, "Initial inference failed/timeout", error_code=-13)
+                return False, FAILED, "Initial inference failed/timeout"
+        else:
+            try:
+                current_actions, infer_latency = run_sync_inference(prepared["example"])
+                rtc_diag["next_chunk_wait_ema"] = infer_latency
+            except Exception as e:
+                logger.error(f"[SYNC] initial inference failed: {e}")
+                task_exiting = True
+                finish_task_with_failure(interface, "Initial sync inference failed", error_code=-13)
+                return False, FAILED, "Initial sync inference failed"
+
         if current_actions is None or len(current_actions) == 0:
             rtc_diag["empty_or_invalid_chunk_count"] += 1
             task_exiting = True
             finish_task_with_failure(interface, "Empty action chunk", error_code=-14)
             return False, FAILED, "Empty action chunk"
 
-        def is_valid_chunk(chunk):
-            return chunk is not None and len(chunk) > 0
-
-        if "delta" not in args.pretrained_path:
-            logger.warning(
-                "[RTC] policy appears non-delta action mode; inter-chunk consistency may be weaker at boundaries."
-            )
+        if use_rtc_fusion and "delta" not in args.pretrained_path:
+            logger.warning("[RTC] policy appears non-delta action mode; inter-chunk consistency may be weaker at boundaries.")
             logger.warning("[RTC] RTC enabled in non-delta mode; expect weaker inter-chunk consistency")
 
         detected_horizon = current_actions.shape[0]
@@ -1065,14 +1093,11 @@ def execute_single_task(
             f"[RTC CONFIG] CONTROL_DT={CONTROL_DT}, ACTION_HORIZON={current_actions.shape[0]}, "
             f"RTC_OVERLAP={RTC_OVERLAP}, RTC_FROZEN={RTC_FROZEN}, "
             f"RTC_REQUEST_LEAD_STEPS={RTC_REQUEST_LEAD_STEPS}, RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, "
-            f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}, latency_ema={async_worker.get_latency_ema()}, "
-            f"next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
+            f"ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}, use_async_prefetch={use_async_prefetch}, use_rtc_fusion={use_rtc_fusion}"
         )
         if detected_horizon != 32:
-            logger.warning(
-                f"Expected action horizon 32, but got {detected_horizon}. RTC defaults may be suboptimal."
-            )
-        else:
+            logger.warning(f"Expected action horizon 32, but got {detected_horizon}. RTC defaults may be suboptimal.")
+        elif use_rtc_fusion:
             logger.info("RTC tuned for action horizon 32.")
 
         while not task_complete:
@@ -1082,40 +1107,41 @@ def execute_single_task(
                 task_exiting = True
                 finish_task_with_failure(interface, "Empty action chunk", error_code=-14)
                 return False, FAILED, "Empty action chunk"
+
             exec_steps = actions.shape[0]
             async_requested = False
             switched = False
             pending_request_id = None
             next_chunk_item_snapshot = current_item_snapshot
             last_unexecuted_tail = actions[-1:, ...]
-            rtc_frozen = async_worker.get_recommended_frozen(
-                control_dt=CONTROL_DT,
-                action_horizon=actions.shape[0],
-                default_frozen=RTC_FROZEN,
-            )
-            rtc_overlap_effective = max(RTC_OVERLAP, rtc_frozen + 4)
-            rtc_overlap_effective = max(1, min(rtc_overlap_effective, max(1, exec_steps - 1)))
 
-            swap_guard_steps = max(RTC_SWAP_GUARD_STEPS, rtc_frozen)
-            swap_guard_steps = min(swap_guard_steps, max(1, exec_steps - 1))
-
-            request_lead_steps = max(RTC_REQUEST_LEAD_STEPS, rtc_frozen + 2)
-            request_lead_steps = min(request_lead_steps, max(1, exec_steps - 1))
-
-            rtc_swap_idx = max(0, exec_steps - swap_guard_steps)
-            rtc_trigger_idx = max(0, rtc_swap_idx - request_lead_steps)
-            if step_counter % 100 == 0:
-                logger.info(
-                    f"[RTC DIAG] ACTION_HORIZON={actions.shape[0]}, default_frozen={RTC_FROZEN}, rtc_frozen={rtc_frozen}, "
-                    f"rtc_overlap_effective={rtc_overlap_effective}, trigger_idx={rtc_trigger_idx}, swap_idx={rtc_swap_idx}, "
-                    f"request_lead={request_lead_steps}, swap_guard={swap_guard_steps}, "
-                    f"RTC_REQUEST_LEAD_STEPS={RTC_REQUEST_LEAD_STEPS}, RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, "
-                    f"exec_steps={exec_steps}, submitted={rtc_diag['overlap_requests_submitted']}, "
-                    f"switched={rtc_diag['successful_rtc_switches']}, fallbacks={rtc_diag['blocking_fallbacks']}, "
-                    f"stale_dropped={async_worker.get_stale_inflight_dropped()}, "
-                    f"empty_invalid={rtc_diag['empty_or_invalid_chunk_count']}, latency_ema={async_worker.get_latency_ema()}, "
-                    f"next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
+            rtc_frozen = rtc_overlap_effective = rtc_swap_idx = rtc_trigger_idx = None
+            if use_rtc_fusion:
+                rtc_frozen = async_worker.get_recommended_frozen(
+                    control_dt=CONTROL_DT,
+                    action_horizon=actions.shape[0],
+                    default_frozen=RTC_FROZEN,
                 )
+                rtc_overlap_effective = max(RTC_OVERLAP, rtc_frozen + 4)
+                rtc_overlap_effective = max(1, min(rtc_overlap_effective, max(1, exec_steps - 1)))
+                swap_guard_steps = max(RTC_SWAP_GUARD_STEPS, rtc_frozen)
+                swap_guard_steps = min(swap_guard_steps, max(1, exec_steps - 1))
+                request_lead_steps = max(RTC_REQUEST_LEAD_STEPS, rtc_frozen + 2)
+                request_lead_steps = min(request_lead_steps, max(1, exec_steps - 1))
+                rtc_swap_idx = max(0, exec_steps - swap_guard_steps)
+                rtc_trigger_idx = max(0, rtc_swap_idx - request_lead_steps)
+                if ENABLE_RTC_DIAG_LOGS and step_counter % 100 == 0:
+                    logger.info(
+                        f"[RTC DIAG] ACTION_HORIZON={actions.shape[0]}, default_frozen={RTC_FROZEN}, rtc_frozen={rtc_frozen}, "
+                        f"rtc_overlap_effective={rtc_overlap_effective}, trigger_idx={rtc_trigger_idx}, swap_idx={rtc_swap_idx}, "
+                        f"submitted={rtc_diag['overlap_requests_submitted']}, switched={rtc_diag['successful_rtc_switches']}, "
+                        f"fallbacks={rtc_diag['blocking_fallbacks']}, stale_dropped={async_worker.get_stale_inflight_dropped()}, "
+                        f"empty_invalid={rtc_diag['empty_or_invalid_chunk_count']}, latency_ema={async_worker.get_latency_ema()}, "
+                        f"next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
+                    )
+            elif use_async_prefetch:
+                request_lead_steps = min(max(1, RTC_REQUEST_LEAD_STEPS), max(1, exec_steps - 1))
+                rtc_trigger_idx = max(0, exec_steps - request_lead_steps)
 
             i = 0
             while i < exec_steps:
@@ -1132,7 +1158,10 @@ def execute_single_task(
                 state = get_current_control_state(robot_controller, target_location)
                 if state is None:
                     state_missing_count += 1
-                    logger.warning(f"[RTC] control state unavailable ({state_missing_count}/{MAX_STATE_MISS})")
+                    _rate_limited_warning(
+                        "rtc_control_state_unavailable",
+                        f"[RTC] control state unavailable ({state_missing_count}/{MAX_STATE_MISS})",
+                    )
                     if state_missing_count >= MAX_STATE_MISS:
                         task_exiting = True
                         finish_task_with_failure(interface, "Robot control state unavailable repeatedly", error_code=-9)
@@ -1147,10 +1176,9 @@ def execute_single_task(
                 right_arm_state = state.get("right_arm_joints")
                 if left_pose is None or right_pose is None or left_arm_state is None or right_arm_state is None:
                     state_missing_count += 1
-                    logger.warning(
-                        f"[RTC] control state fields missing ({state_missing_count}/{MAX_STATE_MISS}): "
-                        f"leftPose={left_pose is not None}, rightPose={right_pose is not None}, "
-                        f"left_arm_joints={left_arm_state is not None}, right_arm_joints={right_arm_state is not None}"
+                    _rate_limited_warning(
+                        "rtc_control_state_fields_missing",
+                        f"[RTC] control state fields missing ({state_missing_count}/{MAX_STATE_MISS})",
                     )
                     if state_missing_count >= MAX_STATE_MISS:
                         task_exiting = True
@@ -1159,22 +1187,6 @@ def execute_single_task(
                     time.sleep(0.005)
                     continue
                 state_missing_count = 0
-
-                if (not async_requested) and i >= rtc_trigger_idx:
-                    next_prepared = prepare_policy_example(interface, robot_controller, task_description)
-                    if next_prepared is not None:
-                        current_request_id += 1
-                        pending_request_id = current_request_id
-                        next_chunk_item_snapshot = next_prepared["current_item_snapshot"]
-                        if (not task_exiting) and async_worker.request(next_prepared["example"], pending_request_id, task_epoch=task_epoch):
-                            async_requested = True
-                            rtc_diag["overlap_requests_submitted"] += 1
-                            logger.info(
-                                f"[RTC] overlap request submitted step_i={i}, exec_steps={exec_steps}, "
-                                f"trigger_idx={rtc_trigger_idx}, swap_idx={rtc_swap_idx}, request_id={pending_request_id}"
-                            )
-                    else:
-                        logger.debug("[RTC] overlap preparation unavailable this cycle; skip overlap request")
 
                 act = actions[i]
                 left_arm_joints = np.array(left_arm_state, dtype=np.float32)
@@ -1195,8 +1207,10 @@ def execute_single_task(
                 stable_right = smooth_gripper(right_action_buffer, right_grip_raw)
                 last_left_gripper = resolve_gripper(stable_left, last_left_gripper, left_hand_holding, allow_left_release)
                 last_right_gripper = resolve_gripper(stable_right, last_right_gripper, right_hand_holding, allow_right_release)
-                logger.info(f"[DEBUG ACTION] left_arm_raw={left_arm}")
-                logger.info(f"[DEBUG ACTION] right_arm_raw={right_arm}")
+                if ENABLE_HOTPATH_LOGS:
+                    logger.info(f"[DEBUG ACTION] left_arm_raw={left_arm}")
+                    logger.info(f"[DEBUG ACTION] right_arm_raw={right_arm}")
+
                 safe_action = sanitize_action(
                     left_arm=left_arm,
                     right_arm=right_arm,
@@ -1221,7 +1235,8 @@ def execute_single_task(
                     control_time=CONTROL_DT,
                 )
                 step_counter += 1
-                last_unexecuted_tail = actions[i + 1:]
+                i += 1
+                last_unexecuted_tail = actions[i:]
 
                 right_target_pose = left_target_pose.copy()
                 right_target_pose[1] *= -1
@@ -1239,7 +1254,6 @@ def execute_single_task(
                 if completed:
                     interface.vla_status["status"] = SUCCEEDED
                     task_complete = True
-                    break
 
                 if not left_hand_holding:
                     if last_left_gripper == 1:
@@ -1285,12 +1299,34 @@ def execute_single_task(
                 interface.vla_status["right_item"] = right_item_name
                 set_running_if_not_terminal(interface)
 
-                if async_requested and i >= rtc_swap_idx and pending_request_id is not None:
+                sleep_remaining = max(0.0, CONTROL_DT - (time.time() - start))
+                if sleep_remaining > 0:
+                    time.sleep(sleep_remaining)
+
+                if use_async_prefetch and (not async_requested) and i >= rtc_trigger_idx:
+                    next_prepared = prepare_policy_example(interface, robot_controller, task_description)
+                    if next_prepared is not None:
+                        current_request_id += 1
+                        pending_request_id = current_request_id
+                        next_chunk_item_snapshot = next_prepared["current_item_snapshot"]
+                        if (not task_exiting) and async_worker.request(next_prepared["example"], pending_request_id, task_epoch=task_epoch):
+                            async_requested = True
+                            rtc_diag["overlap_requests_submitted"] += 1
+                            if ENABLE_HOTPATH_LOGS:
+                                logger.info(
+                                    f"[RTC] overlap request submitted step_i={i}, exec_steps={exec_steps}, "
+                                    f"trigger_idx={rtc_trigger_idx}, request_id={pending_request_id}"
+                                )
+
+                if task_complete:
+                    break
+
+                if use_rtc_fusion and async_requested and i >= rtc_swap_idx and pending_request_id is not None:
                     got = async_worker.get_latest_matching_request(pending_request_id, task_epoch=task_epoch)
                     if got is not None:
                         req_id, next_actions = got
                         if req_id == pending_request_id and is_valid_chunk(next_actions):
-                            prev_remaining = actions[i + 1:]
+                            prev_remaining = actions[i:]
                             current_actions = fuse_action_chunks(
                                 prev_remaining,
                                 next_actions,
@@ -1301,11 +1337,10 @@ def execute_single_task(
                             rtc_diag["successful_rtc_switches"] += 1
                             switched = True
                             break
-                        elif req_id == pending_request_id:
+                        if req_id == pending_request_id:
                             rtc_diag["empty_or_invalid_chunk_count"] += 1
-                            logger.warning("[RTC] next chunk empty/invalid at swap; keep running current chunk")
-                time.sleep(max(0.0, CONTROL_DT - (time.time() - start)))
-                i += 1
+                            if ENABLE_HOTPATH_LOGS:
+                                logger.warning("[RTC] next chunk empty/invalid at swap; keep running current chunk")
 
             if task_complete:
                 break
@@ -1314,7 +1349,18 @@ def execute_single_task(
             if len(last_unexecuted_tail) > 0:
                 current_actions = last_unexecuted_tail
                 continue
-            if async_requested and pending_request_id is not None:
+
+            if use_async_prefetch and not async_requested:
+                next_prepared = prepare_policy_example(interface, robot_controller, task_description)
+                if next_prepared is not None:
+                    current_request_id += 1
+                    pending_request_id = current_request_id
+                    next_chunk_item_snapshot = next_prepared["current_item_snapshot"]
+                    async_requested = async_worker.request(next_prepared["example"], pending_request_id, task_epoch=task_epoch)
+                    if async_requested:
+                        rtc_diag["overlap_requests_submitted"] += 1
+
+            if use_async_prefetch and async_requested and pending_request_id is not None:
                 try:
                     wait_t0 = time.time()
                     req_id, next_actions = async_worker.get_blocking_for_request(
@@ -1327,14 +1373,17 @@ def execute_single_task(
                         rtc_diag["next_chunk_wait_ema"] = wait_latency
                     else:
                         rtc_diag["next_chunk_wait_ema"] = 0.8 * rtc_diag["next_chunk_wait_ema"] + 0.2 * wait_latency
-                    prev_remaining = last_unexecuted_tail if len(last_unexecuted_tail) > 0 else actions[-1:, ...]
+                    prev_remaining = actions[-1:, ...]
                     if req_id == pending_request_id and is_valid_chunk(next_actions):
-                        current_actions = fuse_action_chunks(
-                            prev_remaining,
-                            next_actions,
-                            overlap=rtc_overlap_effective,
-                            frozen=rtc_frozen,
-                        )
+                        if use_rtc_fusion:
+                            current_actions = fuse_action_chunks(
+                                prev_remaining,
+                                next_actions,
+                                overlap=rtc_overlap_effective,
+                                frozen=rtc_frozen,
+                            )
+                        else:
+                            current_actions = next_actions
                         current_item_snapshot = next_chunk_item_snapshot
                         rtc_diag["successful_rtc_switches"] += 1
                     elif req_id == pending_request_id:
@@ -1345,19 +1394,47 @@ def execute_single_task(
                         rtc_diag["blocking_fallbacks"] += 1
                         current_actions = prev_remaining
                 except Exception as e:
-                    logger.warning(f"[RTC] async next chunk timeout, fallback remaining/hold action: {e}")
+                    if ENABLE_HOTPATH_LOGS:
+                        logger.warning(f"[RTC] async next chunk timeout, fallback remaining/hold action: {e}")
                     rtc_diag["blocking_fallbacks"] += 1
-                    current_actions = last_unexecuted_tail if len(last_unexecuted_tail) > 0 else actions[-1:, ...]
+                    current_actions = actions[-1:, ...]
             else:
-                current_actions = last_unexecuted_tail if len(last_unexecuted_tail) > 0 else actions[-1:, ...]
+                if use_async_prefetch:
+                    current_actions = actions[-1:, ...]
+                else:
+                    sync_prepared = None
+                    sync_prep_start = time.time()
+                    while sync_prepared is None and (time.time() - sync_prep_start) < INITIAL_PREP_TIMEOUT:
+                        sync_prepared = prepare_policy_example(interface, robot_controller, task_description)
+                        if sync_prepared is None:
+                            time.sleep(0.001)
+                    if sync_prepared is None:
+                        task_exiting = True
+                        finish_task_with_failure(interface, "Synchronous observation unavailable", error_code=-11)
+                        return False, FAILED, "Synchronous observation unavailable"
+                    current_item_snapshot = sync_prepared["current_item_snapshot"]
+                    try:
+                        next_actions, infer_latency = run_sync_inference(sync_prepared["example"])
+                        if rtc_diag["next_chunk_wait_ema"] is None:
+                            rtc_diag["next_chunk_wait_ema"] = infer_latency
+                        else:
+                            rtc_diag["next_chunk_wait_ema"] = 0.8 * rtc_diag["next_chunk_wait_ema"] + 0.2 * infer_latency
+                    except Exception as e:
+                        logger.warning(f"[SYNC] next chunk inference failed, fallback hold action: {e}")
+                        next_actions = None
+                    if is_valid_chunk(next_actions):
+                        current_actions = next_actions
+                    else:
+                        rtc_diag["empty_or_invalid_chunk_count"] += 1
+                        current_actions = actions[-1:, ...]
 
         logger.info(
             f"[RTC SUMMARY] submitted={rtc_diag['overlap_requests_submitted']}, "
             f"switched={rtc_diag['successful_rtc_switches']}, "
             f"fallbacks={rtc_diag['blocking_fallbacks']}, "
-            f"stale_dropped={async_worker.get_stale_inflight_dropped()}, "
+            f"stale_dropped={(async_worker.get_stale_inflight_dropped() if async_worker is not None else 0)}, "
             f"empty_invalid={rtc_diag['empty_or_invalid_chunk_count']}, "
-            f"infer_latency_ema={async_worker.get_latency_ema()}, next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
+            f"infer_latency_ema={(async_worker.get_latency_ema() if async_worker is not None else None)}, next_wait_ema={rtc_diag['next_chunk_wait_ema']}"
         )
         if interface.vla_status.get("status") == SUCCEEDED:
             task_exiting = True
@@ -1369,7 +1446,8 @@ def execute_single_task(
         return False, FAILED, "Task failed"
     finally:
         task_exiting = True
-        async_worker.stop()
+        if async_worker is not None:
+            async_worker.stop()
         robot_controller.init_left()
         robot_controller.init_right()
         robot_controller.h10w_motion.enableRealtimeCmd(False)
@@ -1380,8 +1458,6 @@ def execute_single_task(
         allow_right_release = False
         freeze_left_image = False
         freeze_right_image = False
-
-
 def main(args: Args):
     global normalizer
     rclpy.init()
