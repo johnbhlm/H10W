@@ -590,7 +590,6 @@ def infer_hand_and_rewrite_instruction(
 
 
 
-
 def infer_place_hand_and_rewrite_instruction(task_description: str):
     """
     对 place 任务，如果没有明确左右手，则根据当前 holding 状态补全左右手。
@@ -907,6 +906,7 @@ def execute_single_task(
     global freeze_left_image, freeze_right_image
 
     task_complete = False
+    action_finished = False
     finish_hold_time = 0.5
     finish_start_time = None
     left_target_pose = np.array([0.60, 0.60, 1.21])
@@ -955,6 +955,14 @@ def execute_single_task(
             left_target_pose[2] = 1.0
         else:
             left_target_pose[2] = 1.21
+        
+        if action_finished:
+            task_complete = False
+            finish_start_time = None
+            step_counter = 0
+            left_action_buffer.clear()
+            right_action_buffer.clear()
+            action_finished = False
 
         if "place" in task_description.lower() and "left" not in task_description.lower() and "right" not in task_description.lower():
             place_ret = infer_place_hand_and_rewrite_instruction(task_description)
@@ -976,16 +984,19 @@ def execute_single_task(
             if not infer_ret["success"]:
                 finish_task_with_failure(interface, msg=infer_ret["reason"], error_code=-7)
                 return False, FAILED, infer_ret["reason"]
+            time.sleep(1)
             task_description = infer_ret["new_instruction"]
             interface.latest_instruction = task_description
 
-        reset_per_task_execution_state()
+        # reset_per_task_execution_state()
         if "place" in task_description:
             allow_left_release = "left" in task_description
             allow_right_release = "right" in task_description
             if "left" not in task_description and "right" not in task_description:
                 allow_left_release = True
                 allow_right_release = True
+            left_place_done = False
+            right_place_done = False
 
         use_left = "left" in task_description
         use_right = "right" in task_description
@@ -1007,8 +1018,57 @@ def execute_single_task(
             prev_tail = None
             while not task_complete:
                 if time.time() - task_start_time > TASK_TIMEOUT:
-                    interface.vla_status["status"] = TIMEOUT
-                    return False, TIMEOUT, "Task timeout"
+                    # interface.vla_status["status"] = TIMEOUT
+                    # return False, TIMEOUT, "Task timeout"
+                    
+                    robot_status = robot_controller.get_status()
+                    lpose = robot_status.get("leftPose", None)
+                    rpose = robot_status.get("rightPose", None)
+                    
+                    if "left" in task_description:
+                        left_hand_holding = False
+                        left_item_name = ""
+                        left_grasp_counter = 0
+                        allow_left_release = False
+                        left_place_done = False 
+                        robot_controller.control_lpose(lpose)
+                        robot_controller.init_left()
+                    
+                    if "right" in task_description:
+                        right_hand_holding = False
+                        right_item_name = ""
+                        right_grasp_counter = 0
+                        allow_right_release = False
+                        right_place_done = False
+                        robot_controller.control_rpose(rpose)
+                        robot_controller.init_right()
+
+                    # 如果任务要求双手（如 pick-up apple）
+                    if ("left" not in task_description) and ("right" not in task_description):
+                        # 默认认为是双手任务
+                        left_hand_holding = False
+                        left_item_name = ""
+                        left_grasp_counter = 0
+                        allow_left_release = False
+                        left_place_done = False
+                        robot_controller.control_lpose(lpose)
+
+                        right_hand_holding = False
+                        right_item_name = ""
+                        right_grasp_counter = 0
+                        allow_right_release = False
+                        right_place_done = False
+                        robot_controller.control_rpose(rpose)
+                        
+                    interface.vla_status["left_state"] = 1 if left_hand_holding else 0
+                    interface.vla_status["right_state"] = 1 if right_hand_holding else 0
+                    interface.vla_status["left_item"] = left_item_name
+                    interface.vla_status["right_item"] = right_item_name
+                    
+                    interface.vla_status["status"] = TIMEOUT   # 3 = 完成
+                    task_complete = True
+                    action_finished = True
+                    break
 
                 obs = interface.get_observations()
                 if obs is None:
