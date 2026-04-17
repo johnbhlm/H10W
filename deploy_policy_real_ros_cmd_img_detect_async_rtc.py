@@ -403,6 +403,9 @@ class Args:
     control_dt: float = 0.01
     async_queue_size: int = 2
     prefetch_lead_steps: int = 6
+    smooth_overlap: int = 2
+    smooth_alpha: float = 0.5
+    smooth_tail_steps: int = 1
     rtc_overlap: int = 8
     rtc_frozen: int = 6
     rtc_alpha: float = 0.5
@@ -867,7 +870,7 @@ def sanitize_action(left_arm, right_arm, left_gripper, right_gripper, target_loc
 
 
 
-def fuse_chunk(prev_tail, next_chunk, overlap: int, alpha: float = 0.5):
+def fuse_chunk(prev_tail, next_chunk, overlap: int, alpha: float = 0.5, tail_steps: int = 1):
     """Synchronous lightweight chunk-boundary smoothing (non-RTC)."""
     prev = np.asarray(prev_tail, dtype=np.float32)
     nxt = np.asarray(next_chunk, dtype=np.float32)
@@ -876,12 +879,22 @@ def fuse_chunk(prev_tail, next_chunk, overlap: int, alpha: float = 0.5):
     if prev.size == 0 or prev.ndim != 2 or prev.shape[1] < 16:
         return nxt
 
+    blend_steps = min(max(int(overlap), 0), len(nxt), 3)
+    if blend_steps <= 0:
+        return nxt
+
+    use_tail_steps = min(max(int(tail_steps), 1), len(prev))
+    tail = prev[-use_tail_steps:]
+    if use_tail_steps == 1:
+        anchor = tail[-1]
+    else:
+        weights = np.linspace(1.0, float(use_tail_steps), use_tail_steps, dtype=np.float32)
+        weights = weights / weights.sum()
+        anchor = np.sum(tail * weights[:, None], axis=0)
+
     smoothed = nxt.copy()
-    blend_steps = max(1, min(int(overlap), len(smoothed), 3))
-    anchor = prev[-1]
-    for i in range(blend_steps):
-        t = (i + 1) / (blend_steps + 1)
-        a = float(np.clip(alpha * t, 0.0, 1.0))
+    alphas = np.linspace(float(np.clip(alpha, 0.0, 1.0)), 1.0, blend_steps, dtype=np.float32)
+    for i, a in enumerate(alphas):
         smoothed[i, 0:7] = (1.0 - a) * anchor[0:7] + a * smoothed[i, 0:7]
         smoothed[i, 8:15] = (1.0 - a) * anchor[8:15] + a * smoothed[i, 8:15]
     return smoothed
@@ -1156,7 +1169,13 @@ def execute_single_task(
                 actions = response["raw_actions"]
                 if args.run_mode == "sync_smooth" and prev_tail is not None and len(prev_tail) > 0:
                     logger.debug("[SYNC_SMOOTH] apply lightweight [CHUNK_SMOOTH] at chunk boundary")
-                    actions = fuse_chunk(prev_tail, actions, overlap=args.rtc_overlap, alpha=args.rtc_alpha)
+                    actions = fuse_chunk(
+                        prev_tail,
+                        actions,
+                        overlap=args.smooth_overlap,
+                        alpha=args.smooth_alpha,
+                        tail_steps=args.smooth_tail_steps,
+                    )
                 interface.vla_status["status"] = RUNNING
 
                 exec_steps = actions.shape[0]
@@ -1239,7 +1258,8 @@ def execute_single_task(
                     interface.vla_status["left_item"] = left_item_name
                     interface.vla_status["right_item"] = right_item_name
 
-                prev_tail = actions[-1:, ...]
+                keep_tail = max(1, int(args.smooth_tail_steps))
+                prev_tail = actions[-keep_tail:, ...]
         else:
             prepared = wait_prepare(task_description, INITIAL_PREP_TIMEOUT)
             if prepared is None:
@@ -1515,6 +1535,8 @@ def main(args: Args):
     logger.info(
         f"Runtime config: mode={args.run_mode}, control_dt={args.control_dt}, action_horizon=unknown, "
         f"async_enabled={mode_async}, chunk_fusion_enabled={mode_chunk_fusion}, "
+        f"SYNC_SMOOTH_OVERLAP={args.smooth_overlap}, SYNC_SMOOTH_ALPHA={args.smooth_alpha}, "
+        f"SYNC_SMOOTH_TAIL_STEPS={args.smooth_tail_steps}, "
         f"CHUNK_OVERLAP={args.rtc_overlap}, CHUNK_ALPHA={args.rtc_alpha}, "
         f"ASYNC_RTC_FROZEN={args.rtc_frozen}, ASYNC_RTC_REQUEST_LEAD_STEPS={args.prefetch_lead_steps}, "
         f"ASYNC_RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}"
