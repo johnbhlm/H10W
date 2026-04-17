@@ -77,20 +77,20 @@ ASYNC_WAIT_TIMEOUT = 2.0
 INITIAL_PREP_TIMEOUT = 3.0
 MIN_FINISH_STEPS = 300
 
-VALID_RUN_MODES = {"sync", "sync_rtc", "async", "async_rtc"}
+VALID_RUN_MODES = {"sync", "sync_smooth", "async", "async_rtc"}
 
 
 def get_exec_mode_flags(exec_mode: str):
     mode = str(exec_mode).strip().lower()
     if mode == "sync":
         return False, False
-    if mode == "sync_rtc":
+    if mode == "sync_smooth":
         return False, True
     if mode == "async":
         return True, False
     if mode == "async_rtc":
         return True, True
-    raise ValueError(f"Invalid EXEC_MODE={exec_mode}. Supported: sync, sync_rtc, async, async_rtc")
+    raise ValueError(f"Invalid EXEC_MODE={exec_mode}. Supported: sync, sync_smooth, async, async_rtc")
 
 # ===============================
 # gripper smoothing buffer
@@ -867,7 +867,27 @@ def sanitize_action(left_arm, right_arm, left_gripper, right_gripper, target_loc
 
 
 
-def fuse_chunks_rtc(prev_chunk, next_chunk, overlap: int, frozen: int, alpha: float = 0.5):
+def fuse_chunk(prev_tail, next_chunk, overlap: int, alpha: float = 0.5):
+    """Synchronous lightweight chunk-boundary smoothing (non-RTC)."""
+    prev = np.asarray(prev_tail, dtype=np.float32)
+    nxt = np.asarray(next_chunk, dtype=np.float32)
+    if nxt.ndim != 2 or nxt.shape[1] < 16:
+        return nxt
+    if prev.size == 0 or prev.ndim != 2 or prev.shape[1] < 16:
+        return nxt
+
+    smoothed = nxt.copy()
+    blend_steps = max(1, min(int(overlap), len(smoothed), 3))
+    anchor = prev[-1]
+    for i in range(blend_steps):
+        t = (i + 1) / (blend_steps + 1)
+        a = float(np.clip(alpha * t, 0.0, 1.0))
+        smoothed[i, 0:7] = (1.0 - a) * anchor[0:7] + a * smoothed[i, 0:7]
+        smoothed[i, 8:15] = (1.0 - a) * anchor[8:15] + a * smoothed[i, 8:15]
+    return smoothed
+
+
+def fuse_chunks_rtc_async(prev_chunk, next_chunk, overlap: int, frozen: int, alpha: float = 0.5):
     prev = np.asarray(prev_chunk, dtype=np.float32)
     nxt = np.asarray(next_chunk, dtype=np.float32)
     if prev.ndim != 2 or nxt.ndim != 2 or prev.shape[1] < 16 or nxt.shape[1] < 16:
@@ -911,8 +931,8 @@ def execute_single_task(
     finish_start_time = None
     left_target_pose = np.array([0.60, 0.60, 1.21])
     target_location = interface.target_location or ""
-    use_async_prefetch, use_rtc_fusion = get_exec_mode_flags(args.run_mode)
-    allow_mid_chunk_switch = use_async_prefetch and use_rtc_fusion
+    use_async_prefetch, use_chunk_fusion = get_exec_mode_flags(args.run_mode)
+    allow_mid_chunk_switch = use_async_prefetch and use_chunk_fusion
     async_worker = AsyncRTCInferenceWorker(
         model,
         wait_timeout=ASYNC_WAIT_TIMEOUT,
@@ -1014,7 +1034,7 @@ def execute_single_task(
         step_counter = 0
         task_start_time = time.time()
 
-        if args.run_mode in ("sync", "sync_rtc"):
+        if args.run_mode in ("sync", "sync_smooth"):
             prev_tail = None
             while not task_complete:
                 if time.time() - task_start_time > TASK_TIMEOUT:
@@ -1134,8 +1154,9 @@ def execute_single_task(
 
                 response = model.step(example)
                 actions = response["raw_actions"]
-                if args.run_mode == "sync_rtc" and prev_tail is not None and len(prev_tail) > 0:
-                    actions = fuse_chunks_rtc(prev_tail, actions, overlap=args.rtc_overlap, frozen=min(args.rtc_frozen, 1), alpha=args.rtc_alpha)
+                if args.run_mode == "sync_smooth" and prev_tail is not None and len(prev_tail) > 0:
+                    logger.debug("[SYNC_SMOOTH] apply lightweight [CHUNK_SMOOTH] at chunk boundary")
+                    actions = fuse_chunk(prev_tail, actions, overlap=args.rtc_overlap, alpha=args.rtc_alpha)
                 interface.vla_status["status"] = RUNNING
 
                 exec_steps = actions.shape[0]
@@ -1397,7 +1418,7 @@ def execute_single_task(
                         if got is not None:
                             _, next_actions = got
                             if is_valid_chunk(next_actions):
-                                current_actions = fuse_chunks_rtc(actions[i:], next_actions, overlap=rtc_overlap, frozen=rtc_frozen, alpha=args.rtc_alpha)
+                                current_actions = fuse_chunks_rtc_async(actions[i:], next_actions, overlap=rtc_overlap, frozen=rtc_frozen, alpha=args.rtc_alpha)
                                 current_item_snapshot = next_chunk_item_snapshot
                                 current_chunk_left_snapshot = next_chunk_left_snapshot
                                 current_chunk_right_snapshot = next_chunk_right_snapshot
@@ -1427,8 +1448,8 @@ def execute_single_task(
                     except Exception:
                         next_actions = None
                     if is_valid_chunk(next_actions):
-                        if use_rtc_fusion:
-                            current_actions = fuse_chunks_rtc(actions[-1:, ...], next_actions, overlap=rtc_overlap, frozen=rtc_frozen, alpha=args.rtc_alpha)
+                        if use_chunk_fusion:
+                            current_actions = fuse_chunks_rtc_async(actions[-1:, ...], next_actions, overlap=rtc_overlap, frozen=rtc_frozen, alpha=args.rtc_alpha)
                         else:
                             current_actions = next_actions
                         current_item_snapshot = next_chunk_item_snapshot
@@ -1463,8 +1484,10 @@ def main(args: Args):
     args.run_mode = str(args.run_mode).strip().lower()
     if args.run_mode not in VALID_RUN_MODES:
         raise ValueError(f"run_mode must be one of {sorted(VALID_RUN_MODES)}, got: {args.run_mode}")
-    if args.rtc_overlap <= args.rtc_frozen:
-        logger.warning(f"rtc_overlap({args.rtc_overlap}) <= rtc_frozen({args.rtc_frozen}), auto fix to frozen+1")
+    if args.run_mode == "async_rtc" and args.rtc_overlap <= args.rtc_frozen:
+        logger.warning(
+            f"async_rtc overlap({args.rtc_overlap}) <= frozen({args.rtc_frozen}), auto fix to frozen+1"
+        )
         args.rtc_overlap = args.rtc_frozen + 1
     rclpy.init()
     stats_path = os.path.join(args.pretrained_path, "dataset_statistics.json")
@@ -1488,12 +1511,13 @@ def main(args: Args):
         image_size=args.resize_size,
     )
     detector_client = DetectionClient3DSync("ws://10.8.26.11:8000")
-    mode_async, mode_rtc = get_exec_mode_flags(args.run_mode)
+    mode_async, mode_chunk_fusion = get_exec_mode_flags(args.run_mode)
     logger.info(
         f"Runtime config: mode={args.run_mode}, control_dt={args.control_dt}, action_horizon=unknown, "
-        f"async_enabled={mode_async}, rtc_enabled={mode_rtc}, "
-        f"RTC_OVERLAP={args.rtc_overlap}, RTC_FROZEN={args.rtc_frozen}, RTC_REQUEST_LEAD_STEPS={args.prefetch_lead_steps}, "
-        f"RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}"
+        f"async_enabled={mode_async}, chunk_fusion_enabled={mode_chunk_fusion}, "
+        f"CHUNK_OVERLAP={args.rtc_overlap}, CHUNK_ALPHA={args.rtc_alpha}, "
+        f"ASYNC_RTC_FROZEN={args.rtc_frozen}, ASYNC_RTC_REQUEST_LEAD_STEPS={args.prefetch_lead_steps}, "
+        f"ASYNC_RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}"
     )
 
     while True:
