@@ -9,6 +9,8 @@ import logging
 import queue
 import os
 import math
+from pathlib import Path
+from typing import Optional
 import numpy as np
 import rclpy
 import tyro
@@ -369,6 +371,104 @@ class AsyncChunkInferenceWorker:
         self._thread.join(timeout=0.5)
 
 
+class ActionChunkLogger:
+    """Lightweight async logger for chunk/step actions using npy + jsonl."""
+
+    def __init__(
+        self,
+        enabled: bool,
+        base_dir: str,
+        mode: str,
+        task_description: str,
+        target_location: str,
+        task_epoch: int,
+        task_id: Optional[str] = None,
+    ):
+        self.enabled = bool(enabled)
+        self.mode = mode
+        self.task_description = task_description
+        self.target_location = target_location
+        self.task_epoch = task_epoch
+        self.task_id = task_id or f"task_{int(time.time() * 1000)}_{mode}"
+        self._chunk_seq = 0
+        self._step_seq = 0
+        self._stopped = False
+        self._q: "queue.Queue[dict]" = queue.Queue(maxsize=2048)
+        self._thread = None
+        self.task_dir = None
+        self.metadata_path = None
+
+        if not self.enabled:
+            return
+
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        self.task_dir = Path(base_dir) / f"{self.task_id}_{ts}_{mode}"
+        self.task_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_path = self.task_dir / "metadata.jsonl"
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"[ACTION_LOG] enabled task_dir={self.task_dir}")
+
+    def _writer_loop(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            try:
+                np.save(item["npy_path"], item["actions"])
+                meta = item["meta"]
+                with open(self.metadata_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            except Exception as e:
+                logger.warning(f"[ACTION_LOG] writer failure: {e}")
+
+    def _enqueue(self, kind: str, actions: np.ndarray, meta: dict, file_prefix: str, seq: int):
+        if not self.enabled or self.task_dir is None:
+            return
+        actions_np = np.asarray(actions)
+        if actions_np.size == 0:
+            return
+        file_name = f"{file_prefix}_{seq:06d}.npy"
+        out_path = self.task_dir / file_name
+        meta_payload = {
+            "task_id": self.task_id,
+            "task_epoch": self.task_epoch,
+            "mode": self.mode,
+            "kind": kind,
+            "timestamp": time.time(),
+            "file": file_name,
+            "shape": list(actions_np.shape),
+            "task_description": self.task_description,
+            "target_location": self.target_location,
+        }
+        if meta:
+            meta_payload.update(meta)
+        try:
+            self._q.put_nowait({"npy_path": out_path, "actions": actions_np, "meta": meta_payload})
+        except queue.Full:
+            logger.warning(f"[ACTION_LOG] queue full, drop log kind={kind}")
+
+    def log_chunk(self, kind: str, actions: np.ndarray, meta: Optional[dict] = None):
+        self._chunk_seq += 1
+        self._enqueue(kind=kind, actions=actions, meta=meta or {}, file_prefix=kind, seq=self._chunk_seq)
+
+    def log_step(self, kind: str, action: np.ndarray, meta: Optional[dict] = None):
+        self._step_seq += 1
+        step_arr = np.asarray(action)[None, ...]
+        self._enqueue(kind=kind, actions=step_arr, meta=meta or {}, file_prefix=kind, seq=self._step_seq)
+
+    def stop(self, timeout: float = 1.0):
+        if not self.enabled or self._stopped:
+            return
+        self._stopped = True
+        try:
+            self._q.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+
 frozen_left_rgb = cv2.imread("/home/diana/intern-vla_test/starVLA/debug_images/left.png")
 frozen_right_rgb = cv2.imread("/home/diana/intern-vla_test/starVLA/debug_images/right.png")
 
@@ -404,6 +504,7 @@ class Args:
     control_dt: float = 0.01
     async_queue_size: int = 2
     prefetch_lead_steps: int = 6
+    async_drop_steps: int = 0
     smooth_overlap: int = 3
     smooth_alpha: float = 0.5
     smooth_tail_steps: int = 0
@@ -411,6 +512,9 @@ class Args:
     rtc_frozen: int = 6
     rtc_alpha: float = 0.5
     enable_action_smoothing: bool = True
+    enable_action_logging: bool = False
+    action_log_dir: str = "./action_logs"
+    log_executed_steps: bool = False
     chunk_min_for_rtc_warn: int = 32
 
     if "unifolm" in pretrained_path:
@@ -1056,6 +1160,15 @@ def execute_single_task(
         result_queue_size=args.async_queue_size,
     ) if use_async_prefetch else None
     current_request_id = 0
+    action_logger = ActionChunkLogger(
+        enabled=args.enable_action_logging,
+        base_dir=args.action_log_dir,
+        mode=args.run_mode,
+        task_description=task_description,
+        target_location=target_location,
+        task_epoch=0,
+    )
+    chunk_id = 0
 
     def is_valid_chunk(chunk):
         return chunk is not None and len(chunk) > 0
@@ -1331,6 +1444,15 @@ def execute_single_task(
                 t_sync = time.time()
                 response = model.step(example)
                 actions = response["raw_actions"]
+                chunk_id += 1
+                action_logger.log_chunk(
+                    "raw_chunk",
+                    actions,
+                    meta={
+                        "chunk_id": chunk_id,
+                        "request_id": None,
+                    },
+                )
                 sync_tag = "[SYNC_SMOOTH]" if args.run_mode == "sync_smooth" else "[SYNC]"
                 logger.info(f"{sync_tag} inference latency={time.time()-t_sync:.3f}s chunk_len={len(actions)}")
                 if args.run_mode == "sync_smooth" and prev_tail is not None and len(prev_tail) > 0:
@@ -1341,6 +1463,14 @@ def execute_single_task(
                         overlap=args.smooth_overlap,
                         alpha=args.smooth_alpha,
                         tail_steps=args.smooth_tail_steps,
+                    )
+                    action_logger.log_chunk(
+                        "sync_smoothed_chunk",
+                        actions,
+                        meta={
+                            "chunk_id": chunk_id,
+                            "request_id": None,
+                        },
                     )
                 interface.vla_status["status"] = RUNNING
 
@@ -1389,6 +1519,15 @@ def execute_single_task(
                         right_gripper=last_right_gripper,
                         control_time=CONTROL_DT,
                     )
+                    if args.log_executed_steps:
+                        exec_action = np.concatenate(
+                            [np.asarray(left_arm), np.array([last_left_gripper]), np.asarray(right_arm), np.array([last_right_gripper])]
+                        )
+                        action_logger.log_step(
+                            "executed_step",
+                            exec_action,
+                            meta={"chunk_id": chunk_id, "step_idx": i},
+                        )
 
                     time.sleep(max(0.0, args.control_dt - (time.time() - start)))
 
@@ -1443,6 +1582,7 @@ def execute_single_task(
                 finish_task_with_failure(interface, f"{mode_tag} initial observation unavailable", error_code=-11)
                 return
             task_epoch = async_worker.start_new_task()
+            action_logger.task_epoch = task_epoch
             current_request_id += 1
             if not async_worker.request(prepared["example"], request_id=current_request_id, task_epoch=task_epoch):
                 finish_task_with_failure(interface, f"{mode_tag} initial inference request rejected", error_code=-12)
@@ -1453,6 +1593,18 @@ def execute_single_task(
             except Exception:
                 finish_task_with_failure(interface, f"{mode_tag} initial inference failed/timeout", error_code=-13)
                 return
+            chunk_id += 1
+            action_logger.log_chunk(
+                "raw_chunk",
+                current_actions,
+                meta={
+                    "chunk_id": chunk_id,
+                    "request_id": current_request_id,
+                    "prefetch_trigger_step": 0,
+                    "boundary_wait_time": 0.0,
+                    "async_drop_steps": int(args.async_drop_steps),
+                },
+            )
             logger.info(f"{mode_tag} first blocking inference latency={time.time() - t0:.3f}s chunk_len={len(current_actions)}")
             current_chunk_context = prepared
 
@@ -1525,12 +1677,41 @@ def execute_single_task(
                         if got is not None:
                             _, next_actions = got
                             if is_valid_chunk(next_actions):
+                                chunk_id += 1
+                                action_logger.log_chunk(
+                                    "raw_chunk",
+                                    next_actions,
+                                    meta={
+                                        "chunk_id": chunk_id,
+                                        "request_id": pending_request_id,
+                                        "trigger_idx": trigger_idx,
+                                        "swap_idx": swap_idx,
+                                        "mid_chunk_switch": True,
+                                        "overlap": rtc_overlap,
+                                        "frozen": rtc_frozen,
+                                        "rtc_alpha": args.rtc_alpha,
+                                    },
+                                )
                                 logger.info(f"[ASYNC_RTC] next chunk ready at swap_idx={i}, request_id={pending_request_id}")
                                 end_idx = min(exec_steps, i + rtc_frozen + rtc_overlap)
                                 prev_remaining = actions[i:end_idx]
                                 if len(prev_remaining) <= 0:
                                     prev_remaining = actions[max(0, exec_steps - (rtc_frozen + rtc_overlap)):exec_steps]
                                 current_actions = fuse_chunks_rtc(prev_remaining, next_actions, overlap=rtc_overlap, frozen=rtc_frozen, alpha=args.rtc_alpha)
+                                action_logger.log_chunk(
+                                    "rtc_fused_chunk",
+                                    current_actions,
+                                    meta={
+                                        "chunk_id": chunk_id,
+                                        "request_id": pending_request_id,
+                                        "trigger_idx": trigger_idx,
+                                        "swap_idx": swap_idx,
+                                        "mid_chunk_switch": True,
+                                        "overlap": rtc_overlap,
+                                        "frozen": rtc_frozen,
+                                        "rtc_alpha": args.rtc_alpha,
+                                    },
+                                )
                                 current_chunk_context = pending_context
                                 switch_done = True
                                 logger.info("[ASYNC_RTC] mid-chunk switch success")
@@ -1553,14 +1734,47 @@ def execute_single_task(
                         prefetch_sent = async_worker.request(pending_context["example"], request_id=pending_request_id, task_epoch=task_epoch)
 
                 next_actions = None
+                boundary_wait = None
                 if prefetch_sent and pending_request_id is not None:
                     t_wait = time.time()
                     try:
                         _, next_actions = async_worker.get_blocking_for_request(pending_request_id, task_epoch=task_epoch, timeout=ASYNC_WAIT_TIMEOUT)
-                        logger.info(f"{mode_tag} boundary wait={time.time() - t_wait:.3f}s request_id={pending_request_id}")
+                        boundary_wait = time.time() - t_wait
+                        logger.info(f"{mode_tag} boundary wait={boundary_wait:.3f}s request_id={pending_request_id}")
                     except Exception:
                         logger.warning(f"{mode_tag} boundary wait timeout, fallback hold-last-step")
+                        boundary_wait = None
                 if is_valid_chunk(next_actions):
+                    chunk_id += 1
+                    action_logger.log_chunk(
+                        "raw_chunk",
+                        next_actions,
+                        meta={
+                            "chunk_id": chunk_id,
+                            "request_id": pending_request_id,
+                            "prefetch_trigger_step": trigger_idx,
+                            "boundary_wait_time": boundary_wait,
+                            "async_drop_steps": int(args.async_drop_steps),
+                            "overlap": rtc_overlap if args.run_mode == "async_rtc" else None,
+                            "frozen": rtc_frozen if args.run_mode == "async_rtc" else None,
+                            "trigger_idx": trigger_idx if args.run_mode == "async_rtc" else None,
+                            "swap_idx": swap_idx if args.run_mode == "async_rtc" else None,
+                            "mid_chunk_switch": False,
+                            "rtc_alpha": args.rtc_alpha if args.run_mode == "async_rtc" else None,
+                        },
+                    )
+                    # async_drop_steps intentionally applies to pure async only.
+                    if args.run_mode == "async" and int(args.async_drop_steps) > 0:
+                        drop_steps = int(args.async_drop_steps)
+                        if len(next_actions) > drop_steps:
+                            logger.info(f"[ASYNC] apply drop-first-k, drop_steps={drop_steps}, old_len={len(next_actions)}, new_len={len(next_actions) - drop_steps}")
+                            next_actions = next_actions[drop_steps:]
+                        else:
+                            logger.warning(
+                                f"[ASYNC] next chunk too short for drop-first-k, fallback keep last step. "
+                                f"drop_steps={drop_steps}, chunk_len={len(next_actions)}"
+                            )
+                            next_actions = next_actions[-1:, ...]
                     current_actions = next_actions
                     current_chunk_context = pending_context
                 else:
@@ -1599,7 +1813,17 @@ def execute_single_task(
     
     except KeyboardInterrupt:
         print("Shutting down...")
-    # finally:
+    finally:
+        if async_worker is not None:
+            try:
+                async_worker.stop()
+            except Exception:
+                pass
+        if action_logger is not None:
+            try:
+                action_logger.stop()
+            except Exception:
+                pass
         
 
 def main(args: Args):
@@ -1642,6 +1866,9 @@ def main(args: Args):
         f"SYNC_SMOOTH_TAIL_STEPS={args.smooth_tail_steps}, "
         f"CHUNK_OVERLAP={args.rtc_overlap}, CHUNK_ALPHA={args.rtc_alpha}, "
         f"ASYNC_RTC_FROZEN={args.rtc_frozen}, ASYNC_RTC_REQUEST_LEAD_STEPS={args.prefetch_lead_steps}, "
+        f"ASYNC_DROP_STEPS={args.async_drop_steps}, "
+        f"ENABLE_ACTION_LOGGING={args.enable_action_logging}, ACTION_LOG_DIR={args.action_log_dir}, "
+        f"LOG_EXECUTED_STEPS={args.log_executed_steps}, "
         f"ASYNC_RTC_SWAP_GUARD_STEPS={RTC_SWAP_GUARD_STEPS}, ASYNC_WAIT_TIMEOUT={ASYNC_WAIT_TIMEOUT}"
     )
 
