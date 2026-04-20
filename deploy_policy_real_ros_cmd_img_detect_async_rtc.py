@@ -1513,10 +1513,10 @@ def execute_single_task(
                     #     control_time=args.control_dt,
                     # )
                     robot_controller.control_joints(
-                        left_arm=left_arm,
-                        right_arm=right_arm,
-                        left_gripper=last_left_gripper,
-                        right_gripper=last_right_gripper,
+                        left_arm=left_arm.tolist(),
+                        right_arm=right_arm.tolist(),
+                        left_gripper=int(last_left_gripper),
+                        right_gripper=int(last_right_gripper),
                         control_time=CONTROL_DT,
                     )
                     if args.log_executed_steps:
