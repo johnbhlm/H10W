@@ -1145,10 +1145,10 @@ def execute_policy_action_step(
     last_right_gripper = resolve_gripper(stable_right, last_right_gripper, right_hand_holding, allow_right_release)
 
     robot_controller.control_joints(
-        left_arm=left_arm,
-        right_arm=right_arm,
-        left_gripper=last_left_gripper,
-        right_gripper=last_right_gripper,
+        left_arm=left_arm.tolist(),
+        right_arm=right_arm.tolist(),
+        left_gripper=int(last_left_gripper),
+        right_gripper=int(last_right_gripper),
         control_time=CONTROL_DT,
     )
 
