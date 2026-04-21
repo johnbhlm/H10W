@@ -218,6 +218,71 @@ def check_task_completion(
     return False, finish_start_time
 
 
+def finalize_async_timeout_state(interface, robot_controller, task_description, left_pose, right_pose):
+    global left_hand_holding, right_hand_holding
+    global allow_left_release, allow_right_release
+    global left_grasp_counter, right_grasp_counter
+    global left_place_done, right_place_done
+    global left_item_name, right_item_name
+
+    if "left" in task_description:
+        left_hand_holding = False
+        left_item_name = ""
+        left_grasp_counter = 0
+        allow_left_release = False
+        left_place_done = False
+        if left_pose is not None:
+            robot_controller.control_lpose(left_pose)
+        robot_controller.init_left()
+
+    if "right" in task_description:
+        right_hand_holding = False
+        right_item_name = ""
+        right_grasp_counter = 0
+        allow_right_release = False
+        right_place_done = False
+        if right_pose is not None:
+            robot_controller.control_rpose(right_pose)
+        robot_controller.init_right()
+
+    if ("left" not in task_description) and ("right" not in task_description):
+        left_hand_holding = False
+        left_item_name = ""
+        left_grasp_counter = 0
+        allow_left_release = False
+        left_place_done = False
+        if left_pose is not None:
+            robot_controller.control_lpose(left_pose)
+
+        right_hand_holding = False
+        right_item_name = ""
+        right_grasp_counter = 0
+        allow_right_release = False
+        right_place_done = False
+        if right_pose is not None:
+            robot_controller.control_rpose(right_pose)
+
+    interface.vla_status["left_state"] = 1 if left_hand_holding else 0
+    interface.vla_status["right_state"] = 1 if right_hand_holding else 0
+    interface.vla_status["left_item"] = left_item_name
+    interface.vla_status["right_item"] = right_item_name
+    interface.vla_status["status"] = TIMEOUT
+
+
+def finalize_async_success_state(interface):
+    global left_hand_holding, right_hand_holding
+    global last_left_gripper, last_right_gripper
+    global left_item_name, right_item_name
+
+    left_hand_holding = (last_left_gripper == 1)
+    right_hand_holding = (last_right_gripper == 1)
+    interface.vla_status["left_state"] = 1 if left_hand_holding else 0
+    interface.vla_status["right_state"] = 1 if right_hand_holding else 0
+    interface.vla_status["left_item"] = left_item_name
+    interface.vla_status["right_item"] = right_item_name
+    interface.vla_status["status"] = SUCCEEDED
+
+
 class AsyncChunkInferenceWorker:
     """异步推理 worker，带 task_epoch/request_id 隔离，防止串任务与旧结果污染。"""
     def __init__(self, model, wait_timeout: float = ASYNC_WAIT_TIMEOUT, request_queue_size: int = 2, result_queue_size: int = 2):
@@ -1634,8 +1699,18 @@ def execute_single_task(
                 while i < exec_steps:
                     step_start = time.time()
                     if time.time() - task_start_time > TASK_TIMEOUT:
-                        interface.vla_status["status"] = TIMEOUT
+                        timeout_status = robot_controller.get_status()
+                        timeout_left_pose = timeout_status.get("leftPose") if timeout_status is not None else None
+                        timeout_right_pose = timeout_status.get("rightPose") if timeout_status is not None else None
+                        finalize_async_timeout_state(
+                            interface=interface,
+                            robot_controller=robot_controller,
+                            task_description=task_description,
+                            left_pose=timeout_left_pose,
+                            right_pose=timeout_right_pose,
+                        )
                         task_complete = True
+                        action_finished = True
                         break
 
                     control_state = get_current_control_state(robot_controller, target_location)
@@ -1647,6 +1722,22 @@ def execute_single_task(
                     if left_pose is None or right_pose is None:
                         time.sleep(0.002)
                         continue
+                    right_target_pose = left_target_pose.copy()
+                    right_target_pose[1] *= -1
+                    dl = np.linalg.norm(np.array(left_pose[:3]) - left_target_pose[:3])
+                    dr = np.linalg.norm(np.array(right_pose[:3]) - right_target_pose[:3])
+                    both_close = (dl < 0.1 and dr < 0.1)
+                    if both_close and step_counter > 300:
+                        if finish_start_time is None:
+                            finish_start_time = time.time()
+                        elif time.time() - finish_start_time >= finish_hold_time:
+                            logger.info("[ASYNC] Task finished by end-effector pose")
+                            finalize_async_success_state(interface)
+                            task_complete = True
+                            action_finished = True
+                            break
+                    else:
+                        finish_start_time = None
 
                     if (not prefetch_sent) and i >= trigger_idx:
                         pending_context = prepare_policy_example(interface, robot_controller, task_description)
@@ -1671,6 +1762,27 @@ def execute_single_task(
                     step_counter += 1
                     i += 1
                     set_running_if_not_terminal(interface)
+                    post_state = get_current_control_state(robot_controller, target_location)
+                    if post_state is not None:
+                        post_left_pose = post_state.get("leftPose")
+                        post_right_pose = post_state.get("rightPose")
+                        if post_left_pose is not None and post_right_pose is not None:
+                            right_target_pose = left_target_pose.copy()
+                            right_target_pose[1] *= -1
+                            dl = np.linalg.norm(np.array(post_left_pose[:3]) - left_target_pose[:3])
+                            dr = np.linalg.norm(np.array(post_right_pose[:3]) - right_target_pose[:3])
+                            both_close = (dl < 0.1 and dr < 0.1)
+                            if both_close and step_counter > 300:
+                                if finish_start_time is None:
+                                    finish_start_time = time.time()
+                                elif time.time() - finish_start_time >= finish_hold_time:
+                                    logger.info("[ASYNC] Task finished by end-effector pose")
+                                    finalize_async_success_state(interface)
+                                    task_complete = True
+                                    action_finished = True
+                                    break
+                            else:
+                                finish_start_time = None
 
                     if args.run_mode == "async_rtc" and prefetch_sent and pending_request_id is not None and i >= swap_idx:
                         got = async_worker.get_latest_matching_request(pending_request_id, task_epoch=task_epoch)
