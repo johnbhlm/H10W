@@ -1129,6 +1129,105 @@ def execute_policy_action_step(
     interface.vla_status["right_item"] = right_item_name
 
 
+def handle_async_timeout(
+    interface,
+    robot_controller,
+    task_description: str,
+):
+    global left_hand_holding, right_hand_holding
+    global allow_left_release, allow_right_release
+    global left_grasp_counter, right_grasp_counter
+    global left_place_done, right_place_done
+    global left_item_name, right_item_name
+
+    robot_status = robot_controller.get_status()
+    if robot_status is not None:
+        lpose = robot_status.get("leftPose", None)
+        rpose = robot_status.get("rightPose", None)
+    else:
+        lpose = None
+        rpose = None
+
+    if "left" in task_description:
+        left_hand_holding = False
+        left_item_name = ""
+        left_grasp_counter = 0
+        allow_left_release = False
+        left_place_done = False
+        if lpose is not None:
+            robot_controller.control_lpose(lpose)
+        robot_controller.init_left()
+
+    if "right" in task_description:
+        right_hand_holding = False
+        right_item_name = ""
+        right_grasp_counter = 0
+        allow_right_release = False
+        right_place_done = False
+        if rpose is not None:
+            robot_controller.control_rpose(rpose)
+        robot_controller.init_right()
+
+    if ("left" not in task_description) and ("right" not in task_description):
+        left_hand_holding = False
+        left_item_name = ""
+        left_grasp_counter = 0
+        allow_left_release = False
+        left_place_done = False
+        if lpose is not None:
+            robot_controller.control_lpose(lpose)
+
+        right_hand_holding = False
+        right_item_name = ""
+        right_grasp_counter = 0
+        allow_right_release = False
+        right_place_done = False
+        if rpose is not None:
+            robot_controller.control_rpose(rpose)
+
+    interface.vla_status["left_state"] = 1 if left_hand_holding else 0
+    interface.vla_status["right_state"] = 1 if right_hand_holding else 0
+    interface.vla_status["left_item"] = left_item_name
+    interface.vla_status["right_item"] = right_item_name
+    interface.vla_status["status"] = TIMEOUT
+
+
+def check_and_finalize_async_success(
+    interface,
+    left_pose,
+    right_pose,
+    left_target_pose,
+    step_counter: int,
+    finish_start_time,
+    finish_hold_time: float,
+):
+    global left_hand_holding, right_hand_holding
+    global last_left_gripper, last_right_gripper
+
+    right_target_pose = left_target_pose.copy()
+    right_target_pose[1] *= -1
+    dl = np.linalg.norm(np.array(left_pose[:3]) - left_target_pose[:3])
+    dr = np.linalg.norm(np.array(right_pose[:3]) - right_target_pose[:3])
+    both_close = (dl < 0.1 and dr < 0.1)
+
+    if both_close and step_counter > MIN_FINISH_STEPS:
+        if finish_start_time is None:
+            finish_start_time = time.time()
+        elif time.time() - finish_start_time >= finish_hold_time:
+            logger.info("[INFO] Task finished by end-effector pose")
+            interface.vla_status["status"] = SUCCEEDED
+            left_hand_holding = (last_left_gripper == 1)
+            right_hand_holding = (last_right_gripper == 1)
+            interface.vla_status["left_state"] = 1 if left_hand_holding else 0
+            interface.vla_status["right_state"] = 1 if right_hand_holding else 0
+            interface.vla_status["left_item"] = left_item_name
+            interface.vla_status["right_item"] = right_item_name
+            return True, finish_start_time
+    else:
+        finish_start_time = None
+    return False, finish_start_time
+
+
 def execute_single_task(
     args: Args,
     interface,
@@ -1634,8 +1733,13 @@ def execute_single_task(
                 while i < exec_steps:
                     step_start = time.time()
                     if time.time() - task_start_time > TASK_TIMEOUT:
-                        interface.vla_status["status"] = TIMEOUT
+                        handle_async_timeout(
+                            interface=interface,
+                            robot_controller=robot_controller,
+                            task_description=task_description,
+                        )
                         task_complete = True
+                        action_finished = True
                         break
 
                     control_state = get_current_control_state(robot_controller, target_location)
@@ -1671,6 +1775,25 @@ def execute_single_task(
                     step_counter += 1
                     i += 1
                     set_running_if_not_terminal(interface)
+
+                    post_state = get_current_control_state(robot_controller, target_location)
+                    if post_state is not None:
+                        post_left_pose = post_state.get("leftPose")
+                        post_right_pose = post_state.get("rightPose")
+                        if post_left_pose is not None and post_right_pose is not None:
+                            completed, finish_start_time = check_and_finalize_async_success(
+                                interface=interface,
+                                left_pose=post_left_pose,
+                                right_pose=post_right_pose,
+                                left_target_pose=left_target_pose,
+                                step_counter=step_counter,
+                                finish_start_time=finish_start_time,
+                                finish_hold_time=finish_hold_time,
+                            )
+                            if completed:
+                                task_complete = True
+                                action_finished = True
+                                break
 
                     if args.run_mode == "async_rtc" and prefetch_sent and pending_request_id is not None and i >= swap_idx:
                         got = async_worker.get_latest_matching_request(pending_request_id, task_epoch=task_epoch)
